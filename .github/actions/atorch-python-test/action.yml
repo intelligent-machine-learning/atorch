@@ -10,7 +10,4 @@ runs:
     - "pip install dlrover[torch]==0.4.0 --no-deps \
 && echo -e 'import math\ninf = math.inf\nnan = math.nan\nstring_classes = \
 (str, bytes)' > /opt/conda/lib/python3.8/site-packages/torch/_six.py \
-&& PYTHONPATH=. pytest atorch/tests/common_tests \
-&& cd .. \
-&& git config --global --add safe.directory /github/workspace \
-&& git clean -xdf"
+&& PYTHONPATH=. pytest atorch/tests/common_tests"
