@@ -1,0 +1,10 @@
+---
+name: atorch-pre-commit
+description: run pre-commit to check codes for atorch
+runs:
+  using: 'docker'
+  image: "easydl/atorch:aci"
+  args:
+    - "/bin/bash"
+    - "-c"
+    - "sh dev/scripts/pre-commit.sh"

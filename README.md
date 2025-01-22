@@ -7,8 +7,8 @@
 
 
 
-   [![GitHub Repo stars](https://img.shields.io/github/stars/intelligent-machine-learning/dlrover?style=social)](https://github.com/intelligent-machine-learning/dlrover/stargazers)
-   [![Build](https://github.com/intelligent-machine-learning/dlrover/actions/workflows/main.yml/badge.svg)](https://github.com/intelligent-machine-learning/dlrover/actions/workflows/main.yml)
+   [![GitHub Repo stars](https://img.shields.io/github/stars/intelligent-machine-learning/atorch?style=social)](https://github.com/intelligent-machine-learning/atorch/stargazers)
+   [![Build](https://github.com/intelligent-machine-learning/atorch/actions/workflows/main.yml/badge.svg)](https://github.com/intelligent-machine-learning/atorch/actions/workflows/main.yml)
    [![PyPI Status Badge](https://badge.fury.io/py/atorch.svg)](https://pypi.org/project/atorch/)
 
 </div>
@@ -74,8 +74,8 @@ pip install atorch
 
 ```
 # clone repository
-git clone https://github.com/intelligent-machine-learning/dlrover.git
-cd dlrover/atorch
+git clone https://github.com/intelligent-machine-learning/atorch.git
+cd atorch
 # build package, optional set version.
 bash dev/scripts/build.sh [version]
 # install the created package in dist directory. Note that if version is set, file name is different.
@@ -90,7 +90,7 @@ pip install dist/atorch-0.1.0.dev0-py3-none-any.whl
 
 - To run [auto_accelerate examples](examples/auto_accelerate):
 ```
-cd dlrover/atorch/examples/auto_accelerate
+cd atorch/examples/auto_accelerate
 # Single process train
 python train.py --model_type toy
 # Distributed train
