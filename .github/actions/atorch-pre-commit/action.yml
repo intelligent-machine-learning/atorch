@@ -7,5 +7,4 @@ runs:
   args:
     - "/bin/bash"
     - "-c"
-    - "cd atorch \
 && sh dev/scripts/pre-commit.sh"
