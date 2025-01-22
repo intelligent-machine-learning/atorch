@@ -204,7 +204,7 @@ setup(
     " large-scale pretraining and finetuning of LLMs with over 100 billion parameters and"
     " thousands of advanced GPUs.",
     author="Ant Group",
-    url="https://github.com/intelligent-machine-learning/dlrover/tree/master/atorch",
+    url="https://github.com/intelligent-machine-learning/atorch",
     python_requires=">=3.8",
     packages=find_packages(exclude=["*test*", "benchmarks*"]),
     install_requires=required_deps,
