@@ -7,4 +7,4 @@ runs:
   args:
     - "/bin/bash"
     - "-c"
-&& sh dev/scripts/pre-commit.sh"
+    - "sh dev/scripts/pre-commit.sh"
