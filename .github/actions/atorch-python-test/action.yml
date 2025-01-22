@@ -7,7 +7,7 @@ runs:
   args:
     - "/bin/bash"
     - "-c"
-    - "pip install dlrover[torch]==0.3.8 --no-deps \
+    - "pip install dlrover[torch]==0.4.0 --no-deps \
 && echo -e 'import math\ninf = math.inf\nnan = math.nan\nstring_classes = \
 (str, bytes)' > /opt/conda/lib/python3.8/site-packages/torch/_six.py \
 && PYTHONPATH=. pytest atorch/tests/common_tests \
