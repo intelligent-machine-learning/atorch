@@ -3,7 +3,7 @@ import functools
 import inspect
 import time
 from contextlib import nullcontext
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import torch
 import torch.nn as nn
@@ -19,8 +19,16 @@ from atorch.auto.accelerate import auto_accelerate
 from atorch.common.util_func import data_float_to_dtype, data_to_device
 from atorch.distributed.distributed import create_parallel_group, destroy_parallel_group
 from atorch.pipeline_parallel.pipe_module import PipeModuleConfig, make_pipe_module
+from atorch.pipeline_parallel.pipe_partition import get_rank_stage_info
 from atorch.pipeline_parallel.pipe_schedule import make_pipe_schedule_from_pipe_module
+from atorch.utils.gc import ManualGarbageCollection
 from atorch.utils.meta_model_utils import init_empty_weights_with_disk_offload
+from atorch.utils.version import torch_version
+
+if torch_version() >= (2, 5, 0):  # type: ignore
+    from torch.distributed.pipelining import ScheduleInterleavedZeroBubble
+else:
+    ScheduleInterleavedZeroBubble = None  # type: ignore
 
 
 class LlamaChunk(LlamaModel):
@@ -75,7 +83,9 @@ class LlamaChunk(LlamaModel):
         return hidden_states
 
 
-def get_llama_model_chunk(model_config, layer_num=None, pre_process=True, post_process=True, meta_init=False):
+def get_llama_model_chunk(
+    model_config, layer_num=None, pre_process=True, post_process=True, meta_init=False, start_layer_idx=None
+):
     context = nullcontext()
     if meta_init:
         context = init_empty_weights_with_disk_offload(ignore_tie_weights=False)
@@ -224,31 +234,6 @@ def pre_create_group(pp_size):
     create_parallel_group(config)
 
 
-# Copy from https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/pipelining_utils.py
-def stage_ids_this_rank(pp_rank: int, pp_size: int, num_stages: int, style: str = "loop"):
-    """Compute the stage ids for the stages that will run on this pp rank for either a looped or V style schedule"""
-    assert num_stages % pp_size == 0, f"num_stages {num_stages} must be evenly divisible by pp_size {pp_size}"
-    stages_per_rank = num_stages // pp_size
-    if style == "loop":
-        return tuple(pp_rank + s * pp_size for s in range(stages_per_rank))
-    elif style == "v":
-        assert stages_per_rank == 2, f"v schedules assume 2 stages per rank, got {stages_per_rank}"
-        stage_v_pairs = list(zip(range(pp_size), range(num_stages - 1, pp_size - 1, -1)))
-        return stage_v_pairs[pp_rank]
-
-
-def get_stage_layer_nums(layer_num, pp_stage_num):
-    stage_per_layer = layer_num // pp_stage_num
-    last_stage_layer = layer_num - stage_per_layer * (pp_stage_num - 1)
-    layer_nums = []
-    for i in range(pp_stage_num):
-        if i < pp_stage_num - 1:
-            layer_nums.append(stage_per_layer)
-        else:
-            layer_nums.append(last_stage_layer)
-    return layer_nums
-
-
 def apply_strategy(stage_ids, stage_num, modules, loss_fn, args):
     res_modules = []
     res_optims = []
@@ -314,6 +299,18 @@ def parse_args():
         required=False,
         help="supported schedule: 1F1B, Interleaved1F1B, etc",
     )
+    parser.add_argument(
+        "--pp_stage_layer_num",
+        type=str,
+        default="",
+        required=False,
+        help="A semicolon-delimited string of integer key-value pairs, where keys and values are separated by a colon;"
+        "key is the stage_id and value is the corresponding layer num. These stages would use corresponding layer nums,"
+        "and other stages would evenly partition the remaining layers."
+        "This can be used for uneven pp partition."
+        "For example, '0:1;3:2' means stage 0 has 1 layer and stage 3 has 2 layers. "
+        "If total layers are 9 and total stages are 4, stage 1 and 2 would have 3 layers.",
+    )
     parser.add_argument("--use_fsdp", default=False, action="store_true")
     parser.add_argument("--use_fp8", default=False, action="store_true")
     parser.add_argument("--use_checkpointing", default=False, action="store_true")
@@ -323,6 +320,9 @@ def parse_args():
     parser.add_argument("--max_checkpoint_module_num", type=int, default=-1, required=False)
     parser.add_argument("--use_atorch_pp", default=False, action="store_true")
     parser.add_argument("--npu", default=False, action="store_true")
+    parser.add_argument("--record_timeline", default=False, action="store_true")
+    parser.add_argument("--timeline_dir", type=str, default="timeline_dir", required=False)
+    parser.add_argument("--record_memory_history", default=False, action="store_true")
 
     return parser.parse_args()
 
@@ -355,6 +355,65 @@ def print_model_size(rank, stage_ids, stage_modules):
     print(f"[rank {rank}] Total params: {total_params}")
 
 
+def train_model(
+    dataloader,
+    optim,
+    schedule,
+    args,
+    global_step,
+    start_time,
+    device,
+    is_first_stage,
+    is_last_stage,
+    total_batchsize,
+    gc_handler,
+    step_time_stats,
+    throughput_stats,
+    max_reserved_stats,
+    max_allocated_stats,
+    prof=None,
+):
+    for batch in dataloader:
+        gc_handler.run(global_step)
+        optim.zero_grad()
+        batch = prepare_input(batch, device)
+        if is_first_stage:
+            schedule.step(batch["input_ids"])
+        elif is_last_stage:
+            schedule.step(target=batch["labels"])
+        else:
+            schedule.step()
+        optim.step()
+        if prof is not None:
+            prof.step()
+        global_step += 1
+        if global_step % args.log_interval == 0 and atorch.rank() == 0:
+            cur_time = time.time()
+            time_per_step = (cur_time - start_time) / args.log_interval
+            sample_per_second = total_batchsize / time_per_step
+            print(f"[step={global_step-1}]: {time_per_step} sec/step, throughput is {sample_per_second} sample/sec.")
+            mem_reserved = torch.cuda.max_memory_reserved() / 1e6
+            mem_allcoated = torch.cuda.max_memory_allocated() / 1e6
+            print(f"max_memory_reserved={mem_reserved} MB, max_memory_allocated={mem_allcoated} MB.")
+            torch.cuda.reset_peak_memory_stats()
+            step_time_stats.append(time_per_step)
+            throughput_stats.append(sample_per_second)
+            max_reserved_stats.append(mem_reserved)
+            max_allocated_stats.append(mem_allcoated)
+            start_time = cur_time
+
+
+def get_manual_stage_partition(args):
+    manual_stage_partition = None
+    if args.pp_stage_layer_num != "":
+        manual_stage_partition = {}
+        pairs = args.pp_stage_layer_num.split(";")
+        for pair in pairs:
+            stage_idx, layer_num = pair.split(":")
+            manual_stage_partition[int(stage_idx)] = int(layer_num)
+    return manual_stage_partition
+
+
 def train(args):
     timeout = timedelta(seconds=args.timeout_sec)
     atorch.init_distributed("nccl", set_cuda_device_using_local_rank=True, timeout=timeout)
@@ -372,16 +431,15 @@ def train(args):
     is_first_stage = pp_rank == 0
     is_last_stage = pp_rank == pp_size - 1
     pp_stage_num = args.pp_num if args.pp_stage_num <= 0 else args.pp_stage_num
-    stage_ids = stage_ids_this_rank(pp_rank, args.pp_num, pp_stage_num)
-    stage_layer_nums = get_stage_layer_nums(args.layer_num, pp_stage_num)
 
     model_config = LlamaConfig()
     c_s = f"hidden_size={args.hidden_size},num_attention_heads={args.head_num},num_hidden_layers={args.layer_num},"
     c_s += f"num_key_value_heads={args.key_value_head_num},max_position_embeddings={args.seq_length},"
     c_s += f"intermediate_size={args.intermediate_size}"
     model_config.update_from_string(c_s)
+    model_config._attn_implementation = "flash_attention_2"
+    model_config.use_cache = False
 
-    # create dataset/dataloader
     batchsize_per_gpu = args.batchsize_per_gpu
     total_batchsize = batchsize_per_gpu * dp_size
     total_data_size = args.max_train_step * total_batchsize
@@ -391,12 +449,16 @@ def train(args):
         datasize = total_data_size
     else:
         datasize = total_data_size // dp_size
-    null_dataset = 0 not in stage_ids and pp_stage_num - 1 not in stage_ids
-    dataset = get_dataset(
-        seq_length=args.seq_length, vocab_size=model_config.vocab_size, datasize=datasize, null_dataset=null_dataset
-    )
 
-    dataloader = get_dataloader(dataset, batchsize_per_gpu, rank, dp_size, args.use_distributed_dataloader)
+    # create dataset/dataloader
+    def create_dataloader(stage_ids):
+        null_dataset = 0 not in stage_ids and pp_stage_num - 1 not in stage_ids
+        dataset = get_dataset(
+            seq_length=args.seq_length, vocab_size=model_config.vocab_size, datasize=datasize, null_dataset=null_dataset
+        )
+
+        dataloader = get_dataloader(dataset, batchsize_per_gpu, dp_rank, dp_size, args.use_distributed_dataloader)
+        return dataloader, null_dataset
 
     # create model
     st = time.time()
@@ -410,6 +472,8 @@ def train(args):
     mp_precision = torch.bfloat16
     stage_group = atorch.distributed.distributed.parallel_group("pipe")
 
+    manual_stage_partition = get_manual_stage_partition(args)
+
     if args.use_atorch_pp:
         activation_mapping = [("hidden_states", 0)]
         batch_mapping = [("input_ids", 0)]
@@ -420,6 +484,7 @@ def train(args):
         # create PipeModuleConfig
         pm_config = PipeModuleConfig(
             model_config=model_config,
+            manual_stage_partition=manual_stage_partition,
             total_layer_num=args.layer_num,
             tie_weight_info=None,
             input_output_mapping=io_mapping,
@@ -435,6 +500,8 @@ def train(args):
             model_provider=get_llama_model_chunk, loss_func=loss_fn, strategy=accelerate_strategy, config=pm_config
         )
 
+        stage_ids = pipe_module.stage_ids
+
         # create schedule
         schedule = make_pipe_schedule_from_pipe_module(pipe_module, pm_config)
 
@@ -446,7 +513,19 @@ def train(args):
         else:
             optim = optim_func(pipe_module.parameters(), **optim_args)
 
+        dataloader, _ = create_dataloader(stage_ids)
     else:
+        # total_layer_num, pp_rank, pp_size, virtual_pp_size, style="loop", manual_stage_partition=None)
+        stage_info = get_rank_stage_info(
+            args.layer_num,
+            pp_rank,
+            args.pp_num,
+            pp_stage_num // args.pp_num,
+            manual_stage_partition=manual_stage_partition,
+        )
+
+        stage_ids = [idx for (idx, _, _) in stage_info]
+        stage_layer_nums = [layer_num for (_, layer_num, _) in stage_info]
         # get pp stage modules for current rank
         stage_modules = get_stage_modules(
             model_config, stage_ids, pp_stage_num, stage_layer_nums, meta_init=args.use_meta_init
@@ -457,6 +536,8 @@ def train(args):
 
         # apply strategy to modules
         stage_modules, optim, loss_func = apply_strategy(stage_ids, pp_stage_num, stage_modules, loss_fn, args)
+
+        dataloader, null_dataset = create_dataloader(stage_ids)
 
         split_batch = None
         if not null_dataset:
@@ -505,6 +586,8 @@ def train(args):
             stages = stages[0]
         elif args.pp_schedule == "Interleaved1F1B":
             schedule_cls = ScheduleInterleaved1F1B
+        elif args.pp_schedule == "ZeroBubble":
+            schedule_cls = ScheduleInterleavedZeroBubble
 
         # Last stage has loss_func, and other stages use original loss_fn to indicate that pp requires backward.
         schedule = schedule_cls(
@@ -515,6 +598,7 @@ def train(args):
         print("Get model time : ", time.time() - st)
 
     global_step = 0
+    gc_handler = ManualGarbageCollection(gc_freq=10, disable_auto_gc=True)
     start_time = time.time()
 
     step_time_stats = []
@@ -522,31 +606,84 @@ def train(args):
     max_reserved_stats = []
     max_allocated_stats = []
 
-    for batch in dataloader:
-        optim.zero_grad()
-        batch = prepare_input(batch, device)
-        if is_first_stage:
-            schedule.step(batch["input_ids"])
-        elif is_last_stage:
-            schedule.step(target=batch["labels"])
-        else:
-            schedule.step()
-        optim.step()
-        global_step += 1
-        if global_step % args.log_interval == 0 and atorch.rank() == 0:
-            cur_time = time.time()
-            time_per_step = (cur_time - start_time) / args.log_interval
-            sample_per_second = total_batchsize / time_per_step
-            print(f"[step={global_step-1}]: {time_per_step} sec/step, throughput is {sample_per_second} sample/sec.")
-            mem_reserved = torch.cuda.max_memory_reserved() / 1e6
-            mem_allcoated = torch.cuda.max_memory_allocated() / 1e6
-            print(f"max_memory_reserved={mem_reserved} MB, max_memory_allocated={mem_allcoated} MB.")
-            torch.cuda.reset_peak_memory_stats()
-            step_time_stats.append(time_per_step)
-            throughput_stats.append(sample_per_second)
-            max_reserved_stats.append(mem_reserved)
-            max_allocated_stats.append(mem_allcoated)
-            start_time = cur_time
+    if args.record_timeline:
+        with torch.profiler.profile(
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
+            record_shapes=True,
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(
+                wait=1,  # Skip first N steps, profiler is disabled
+                warmup=1,  # Warmup steps, profiler is enabled, but results are discarded
+                active=5,  # Profiler works and records events.
+                repeat=1,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.timeline_dir),
+        ) as prof:
+            train_model(
+                dataloader,
+                optim,
+                schedule,
+                args,
+                global_step,
+                start_time,
+                device,
+                is_first_stage,
+                is_last_stage,
+                total_batchsize,
+                gc_handler,
+                step_time_stats,
+                throughput_stats,
+                max_reserved_stats,
+                max_allocated_stats,
+                prof,
+            )
+    elif args.record_memory_history:
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        file_name = f"visual_mem_{timestamp}.pickle"
+        try:
+            train_model(
+                dataloader,
+                optim,
+                schedule,
+                args,
+                global_step,
+                start_time,
+                device,
+                is_first_stage,
+                is_last_stage,
+                total_batchsize,
+                gc_handler,
+                step_time_stats,
+                throughput_stats,
+                max_reserved_stats,
+                max_allocated_stats,
+            )
+        except Exception as e:
+            print(str(e))
+        finally:
+            torch.cuda.memory._dump_snapshot(file_name)
+            torch.cuda.memory._record_memory_history(enabled=None)
+    else:
+        train_model(
+            dataloader,
+            optim,
+            schedule,
+            args,
+            global_step,
+            start_time,
+            device,
+            is_first_stage,
+            is_last_stage,
+            total_batchsize,
+            gc_handler,
+            step_time_stats,
+            throughput_stats,
+            max_reserved_stats,
+            max_allocated_stats,
+        )
 
     if atorch.rank() == 0:
         print("Finished training!")
@@ -561,6 +698,7 @@ def train(args):
             print(f"Average thoughput: {avg_throughput} sample/sec, {avg_throughput_token} token/gpu/sec.")
             print(f"max_memory_reserved={avg_max_reserved} MB, max_memory_allocated={avg_max_allocated} MB.")
 
+    torch.distributed.barrier()
     destroy_parallel_group()
 
 

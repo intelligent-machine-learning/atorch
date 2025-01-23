@@ -53,7 +53,7 @@ class _MoeGather(torch.autograd.Function):
         input_size = ctx.input_size
         map_ = ctx.map
 
-        output = torch.zeros(input_size, dtype=grad_output.dtype, device=torch.cuda.current_device())
+        output = torch.zeros(input_size, dtype=grad_output.dtype, device=grad_output.device)
         output.scatter_add_(0, map_, grad_output)
         return output, None, None
 
@@ -64,7 +64,7 @@ class _MoeScatter(torch.autograd.Function):
         ctx.map = map_
 
         if output_size is not None:
-            output = torch.zeros(output_size, dtype=input_.dtype, device=torch.cuda.current_device())
+            output = torch.zeros(output_size, dtype=input_.dtype, device=input_.device)
         else:
             output = torch.zeros_like(input_)
 
@@ -274,7 +274,17 @@ class MoEAllToAllTokenDispatcher(MoETokenDispatcher):
         )
 
         self.use_fused_kernel = False
+        self.permute_fn = permute
         self.unpermute_fn = unpermute
+
+        # Use te permute/unpermute ops if available and not disabled.
+        if not EnvSetting().MOE_NV_DISABLE_FUSED_KERNEL and not is_torch_npu_available():
+            from atorch.kernels import te_permute, te_unpermute
+
+            if te_permute is not None and te_unpermute is not None:
+                self.use_fused_kernel = True
+                self.permute_fn = te_permute
+                self.unpermute_fn = te_unpermute
 
         self.hidden_shape: Optional[torch.Size] = None
         self.num_input_tokens = None
@@ -334,7 +344,7 @@ class MoEAllToAllTokenDispatcher(MoETokenDispatcher):
             expert_ids_per_ep_rank = torch.tensor(
                 [i % self.num_local_experts for i in range(self.num_experts)],
                 dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                device=self.num_global_tokens_per_local_expert.device,
             )
             self.global_input_tokens_local_experts_indices = torch.repeat_interleave(
                 expert_ids_per_ep_rank, self.num_global_tokens_per_local_expert.ravel()
@@ -373,7 +383,7 @@ class MoEAllToAllTokenDispatcher(MoETokenDispatcher):
 
         # Permutation 1: input to AlltoAll input
         self.hiddden_shape_before_permute = hidden_states.shape
-        permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
+        permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = self.permute_fn(
             hidden_states,
             max_ind,
             num_out_tokens=self.num_out_tokens,
@@ -395,7 +405,7 @@ class MoEAllToAllTokenDispatcher(MoETokenDispatcher):
             git_handle.wait()
             # Permutation 2: Sort alltoall output by local experts when num_local_experts > 1.
             if self.num_local_experts > 1:
-                global_input_tokens, self.reversed_global_input_permutation_mapping = permute(
+                global_input_tokens, self.reversed_global_input_permutation_mapping = self.permute_fn(
                     global_input_tokens, self.global_input_tokens_local_experts_indices
                 )
         else:
@@ -647,7 +657,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 unpermuted_global_hidden = torch.zeros(
                     global_hidden_shape,
                     dtype=hidden_states.dtype,
-                    device=torch.cuda.current_device(),
+                    device=hidden_states.device,
                 )
                 output_total = unpermuted_global_hidden.scatter_add(0, self.global_local_map, unpermuted_local_hidden)
                 if self.add_bias:
@@ -796,7 +806,7 @@ class MindSpeedAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
             global_hidden_shape = [global_num_tokens, hidden_states.shape[-1]]
             if is_torch_npu_available() and EnvSetting().MOE_REPLACE_MINDSPEED_ALLGATHER_TOKENDISPATCHER_INDEX:
                 unpermuted_global_hidden = torch.zeros(
-                    global_hidden_shape, dtype=torch.float, device=torch.cuda.current_device()
+                    global_hidden_shape, dtype=torch.float, device=hidden_states.device
                 )
                 unpermuted_global_hidden = new_index_put(
                     unpermuted_global_hidden,
@@ -806,7 +816,7 @@ class MindSpeedAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
                 )
             else:
                 unpermuted_global_hidden = torch.zeros(
-                    global_hidden_shape, dtype=hidden_states.dtype, device=torch.cuda.current_device()
+                    global_hidden_shape, dtype=hidden_states.dtype, device=hidden_states.device
                 )
                 unpermuted_global_hidden.index_put_(
                     (self.global_local_map,),
@@ -832,7 +842,7 @@ class MindSpeedAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
                 unpermuted_global_hidden = torch.zeros(
                     global_hidden_shape,
                     dtype=hidden_states.dtype,
-                    device=torch.cuda.current_device(),
+                    device=hidden_states.device,
                 )
                 output_total = unpermuted_global_hidden.index_put(
                     (self.global_local_map,),
@@ -884,6 +894,7 @@ class MindSpeedAllToAllTokenDispatcher(MoEAllToAllTokenDispatcher):
             self.unpermute_fn = npu_fused_unpermute_func
         else:
             self.use_fused_kernel = False
+            self.unpermute_fn = unpermute
 
     def _permute(self, tokens, indices, topk: int = 1, num_out_tokens: int = 0):
         if self.use_fused_kernel:
@@ -939,7 +950,7 @@ class MindSpeedAllToAllTokenDispatcher(MoEAllToAllTokenDispatcher):
                 expert_ids_per_ep_rank = torch.tensor(
                     [i % self.num_local_experts for i in range(self.num_experts)],
                     dtype=torch.int32,
-                    device=torch.cuda.current_device(),
+                    device=self.num_global_tokens_per_local_expert.device,
                 )
                 self.global_input_tokens_local_experts_indices = torch.repeat_interleave(
                     expert_ids_per_ep_rank, self.num_global_tokens_per_local_expert.ravel()

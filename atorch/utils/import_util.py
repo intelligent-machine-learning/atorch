@@ -2,7 +2,12 @@ import importlib
 import os
 from functools import lru_cache
 
+import torch
+
 from atorch.common.log_utils import default_logger as logger
+from atorch.utils.version import package_version_smaller_than, torch_version
+
+_HAS_LIGER_KERNEL = None
 
 
 def import_module_from_py_file(file_path):
@@ -124,3 +129,22 @@ def is_flash_attn_3_avaliable(verbose=False):
     if importlib.util.find_spec("flash_attn_interface") is None:
         return False
     return True
+
+
+def is_liger_kernel_available():
+    global _HAS_LIGER_KERNEL
+    if _HAS_LIGER_KERNEL is not None:
+        return _HAS_LIGER_KERNEL
+
+    # liger-kernel requires torch >= 2.1.2 and trition >= 2.3.0
+    if (
+        not torch.cuda.is_available()
+        or not is_triton_available()
+        or torch_version() < (2, 1, 2)
+        or package_version_smaller_than("triton", "2.3.0")
+        or importlib.util.find_spec("liger_kernel") is None
+    ):
+        _HAS_LIGER_KERNEL = False
+    else:
+        _HAS_LIGER_KERNEL = True
+    return _HAS_LIGER_KERNEL

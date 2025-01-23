@@ -5,17 +5,13 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
-from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
-from transformers.trainer_utils import IntervalStrategy
 from transformers.utils import cached_property, is_torch_available, requires_backends
 
 from atorch.common.log_utils import default_logger as logger
 from atorch.trainer.state import AtorchAcceleratorState
+from atorch.trainer.utils import IntervalStrategy
 from atorch.utils.dataclass_utils import AutoMapperExtraConfigs, DataclassMixin, DynamicDataClass
 from atorch.utils.import_util import is_torch_npu_available
-
-MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 # Attention to developers!!!
 # If you want to add a new mapping to the following dict, you should ensure the arg in AtorchTrainingArgs
@@ -29,6 +25,12 @@ COMMON_TO_MEGATRON_ARG_MAP = {
     "logging_steps": "log_interval",
     "eval_steps": "eval_interval",
     "tensorboard_dir": "tensorboard_dir",
+    "manual_gc": "manual_gc",
+    "manual_gc_interval": "manual_gc_interval",
+    "manual_gc_eval": "manual_gc_eval",
+    "profile_step_start": "profile_step_start",
+    "profile_step_end": "profile_step_end",
+    "profile_ranks": "profile_ranks",
     # torch init process
     # Comment the following two lines temporarily.
     # "ddp_backend": "distributed_backend",
@@ -43,7 +45,7 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         metadata={
             "help": 'Select a profiler platform. "hw": torch NPU profiler; "hw_dp": torch NPU dynamic profiler; '
             '"nv": origin torch profiler.',
-            "choices": [None, "hw", "hw_dp", "nv"],
+            "choices": [None, "hw", "hw_dp", "nv", "nsys"],
         },
     )
     profiler_file_path: Optional[str] = field(
@@ -60,6 +62,21 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
     dynamic_profiler_config_path: Optional[str] = field(
         default=None, metadata={"help": "The config directory when using torch NPU dynamic profiler."}
     )
+    profile_step_start: int = field(default=10, metadata={"help": "Global step to start profiling."})
+    profile_step_end: int = field(default=12, metadata={"help": "Global step to stop profiling."})
+    profile_ranks: List[int] = field(default_factory=lambda: [0], metadata={"help": "Global ranks to profile."})
+
+    # MindStudio Training Tools: https://gitee.com/ascend/mstt
+    msprob_monitor_config_file: Optional[str] = field(
+        default=None, metadata={"help": "A json file to configure the Monitor of mstt's msprobe."}
+    )
+
+    debug_switch: dict = field(
+        default_factory=dict,
+        metadata={
+            "help": "switches to enable some features for debugging, " "supported features: " " - log_torch_save: True"
+        },
+    )
 
     flash_checkpoint: bool = field(
         default=False,
@@ -69,9 +86,26 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         },
     )
 
+    flash_checkpoint_timeout: int = field(
+        default=20 * 60,
+        metadata={
+            "help": "when use flash_checkpoint, async saving process will be terminated if it takes longer then this "
+            "timeout setting."
+        },
+    )
+
     save_total_limit: int = field(
         default=None,
         metadata={"help": "Max save ckpt versions. 'None' means will keep all the checkpoints."},
+    )
+
+    convert_checkpoint: bool = field(default=False, metadata={"help": "Convert checkpoint."})
+
+    output_dir_for_converting: str = field(
+        default=None,
+        metadata={
+            "help": "The output_dir when doing checkpoint converting. Only valid when `convert_checkpoint` is True."
+        },
     )
 
     output_dir: str = field(
@@ -145,8 +179,6 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         metadata={"help": "Number of updates steps to accumulate before performing a backward/update pass."},
     )
 
-    checkpoint_save_limit: Optional[int] = field(default=3, metadata={"help": ""})
-
     distributed_type: str = field(
         default="ddp",
         metadata={
@@ -176,6 +208,36 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         },
     )
 
+    manual_gc: bool = field(
+        default=False,
+        metadata={
+            "help": "Disable the threshold-based default garbage "
+            "collector and trigger the garbage collection manually. "
+            "Manual garbage collection helps to align the timing of "
+            "the collection across ranks which mitigates the impact "
+            "of CPU-associated jitters. When the manual gc is enabled, "
+            "garbage collection is performed only at the start and the "
+            "end of the validation routine by default."
+        },
+    )
+
+    manual_gc_interval: int = field(
+        default=0,
+        metadata={
+            "help": "Training step interval to trigger manual garbage "
+            "collection. When the value is set to 0, garbage "
+            "collection is not triggered between training steps."
+        },
+    )
+
+    manual_gc_eval: bool = field(
+        default=True,
+        metadata={
+            "help": "When using manual garbage collection, disable garbage collection "
+            "at the start and the end of each evaluation run."
+        },
+    )
+
     # Args about optimizer.
     learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
@@ -196,6 +258,19 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
     save_steps: int = field(
         default=500,
         metadata={"help": ("Save checkpoint every X steps. Should be an integer.")},
+    )
+
+    save_samples: int = field(
+        default=None,
+        metadata={"help": ("Save checkpoint every X consumed samples. Should be an integer.")},
+    )
+
+    save_frequency: Optional[List[Union[int, float]]] = field(
+        default=None, metadata={"help": "Deprecated, please use `extra_save_frequency_in_epoch` instead."}
+    )
+
+    extra_save_frequency_in_epoch: Optional[List[Union[int, float]]] = field(
+        default=None, metadata={"help": "Save frequency in each epoch."}
     )
 
     # Evaluation
@@ -282,6 +357,38 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         metadata={"help": "If True, use gradient checkpointing to save memory at the expense of slower backward pass."},
     )
 
+    use_deterministic_algorithms: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Wether to use deterministic algorithm. If True, will open torch's deterministic algorithm and "
+                "close torch.jit.script or torch.compile: "
+                "1. torch.use_deterministic_algorithms(True); "
+                "2. torch._C._jit_set_nvfuser_enabled(False)"
+            )
+        },
+    )
+
+    empty_cache_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": ("Empty torch cache every X steps. Should be an integer.")},
+    )
+    finetune_type: str = field(
+        default=None,
+        metadata={
+            "help": "Set the type finetune task.",
+            "choices": [
+                "sft",
+                "dpo",
+            ],
+        },
+    )
+
+    custom_dpo_infer_function: Optional[Callable] = field(
+        default=None,
+        metadata={"help": "Custom DPO infer function, necessary when training DPO task."},
+    )
+
     def validate_megatron_args(self):
         if self.distributed_type not in ["megatron", "mindspeed"]:
             return
@@ -326,6 +433,27 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
                 "Set 'overwrite_output_dir' to true to confirm that you do want to overwrite the deprecated ckpts."
             )
 
+        self.logging_strategy = IntervalStrategy(self.logging_strategy)
+        self.save_strategy = IntervalStrategy(self.save_strategy)
+        self.evaluation_strategy = IntervalStrategy(self.evaluation_strategy)
+
+        if self.save_strategy == IntervalStrategy.SAMPLES:
+            assert self.save_samples is not None, '`save_samples` should be set when using "samples" save_strategy.'
+            assert self.save_samples > 0
+
+        if self.save_frequency is not None:
+            logger.warning("Please use `extra_save_frequency_in_epoch` instead of `save_frequency`.")
+            if self.extra_save_frequency_in_epoch is None:
+                self.extra_save_frequency_in_epoch = self.save_frequency
+
+        if self.extra_save_frequency_in_epoch is not None and len(self.extra_save_frequency_in_epoch) > 0:
+            is_all_float = all([isinstance(i, float) for i in self.extra_save_frequency_in_epoch])
+            is_all_int = all([isinstance(i, int) for i in self.extra_save_frequency_in_epoch])
+            assert is_all_float or is_all_int, (
+                "You should set `extra_save_frequency_in_epoch` in one dtype like [10,20] "
+                "or [0.5,0.9,0.99] belongs to [0.0,1.0]."
+            )
+
         self.validate_megatron_args()
 
         if self.rng_types is None:
@@ -357,6 +485,12 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
                         "torch's collection communication backend."
                     )
                     self.ddp_backend = self.extra_configs["distributed_backend"]
+            if "use_dist_ckpt" in self.extra_configs:
+                if self.extra_configs["use_dist_ckpt"] and self.flash_checkpoint:
+                    raise ValueError(
+                        "dist_ckpt does not work with flash_checkpoint, please use sync save, or use "
+                        "async_save in megatron if you are using Megatron-LM >= 0.7.0"
+                    )
 
         # TODO: maybe setup device when init engine.
         self._setup_devices
@@ -366,6 +500,44 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
                 f"profiler_type is set to {self.profiler_file_path}, but torch_npu is not available. "
                 "Please check if torch_npu is installed."
             )
+
+        if self.empty_cache_steps is not None:
+            assert self.empty_cache_steps > 0, "`empty_cache_steps` should be greater than 0."
+
+        if self.gradient_accumulation_steps > 1 and self.distributed_type == "megatron":
+            raise ValueError("`gradient_accumulation_steps` is invalid in Megatron training mode.")
+
+        if self.finetune_type == "dpo" and self.custom_dpo_infer_function is None:
+            raise ValueError("Arg `custom_dpo_infer_function` should be provided when training DPO task.")
+
+        if len(self.debug_switch) > 0:
+            log_torch_save = self.debug_switch.get("log_torch_save", False)
+            if log_torch_save in [True, "True", "TRUE", "true"]:
+                try:
+                    from atorch.trainer.debug_utils.debug_wrappers import wrap_torch_save
+
+                    wrap_torch_save()
+                except Exception:
+                    logger.warning("Unable to wrap torch save, check whether you installed wrapt.")
+                    import traceback
+
+                    traceback.print_exc()
+
+        if self.msprob_monitor_config_file is not None:
+            try:
+                from msprobe.pytorch import TrainerMon  # noqa: F401
+            except ImportError as e:
+                logger.exception(
+                    f"{e} \nCan't import msprobe. If you want to use msprobe monitor, "
+                    "please install `msprobe` from "
+                    "https://gitee.com/ascend/mstt/blob/master/debug/accuracy_tools/msprobe/docs/01.installation.md"
+                )
+                raise e
+
+        if self.convert_checkpoint:
+            assert (
+                self.output_dir_for_converting is not None
+            ), "You must set `output_dir_for_converting` when doing checkpoint converting."
 
     def megatron_args(self) -> "MegatronArgs":
         if self._megatron_args is not None:
@@ -604,3 +776,9 @@ class AtorchDPOTrainingArgs(AtorchTrainingArgs):
     """
 
     pass
+
+
+@dataclass
+class DummyAtorchTrainingArgs(AtorchTrainingArgs):
+    def __post_init__(self):
+        pass

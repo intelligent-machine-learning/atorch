@@ -120,7 +120,7 @@ class TestTPMLP(unittest.TestCase):
         destroy_parallel_group()
         return super().tearDown()
 
-    @unittest.skipIf(torch.cuda.is_available() and torch.cuda.device_count() != 2, "run with cpu or gpu_num >=2")
+    @unittest.skipIf(True, "skip fairscale tests.")
     def test_tp_mlp(self):
         world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "localhost"

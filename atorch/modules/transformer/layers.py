@@ -113,7 +113,7 @@ try:
     from atorch.kernels import dropout_add_layer_norm_1 as dropout_add_layer_norm  # type: ignore
     from atorch.kernels import flash_attn_unpadded_func_1 as flash_attn_1_unpadded_func
 
-    has_legacy_fa1 = True
+    has_legacy_fa1 = flash_attn_1_unpadded_func is not None
     if _flash_attn_version is None:
         _flash_attn_version = parse_version(version("flash-attn-1"))
 except (ImportError, ModuleNotFoundError):

@@ -1,6 +1,11 @@
 # TODO:  Update overflow check + downscale to use Carl's fused kernel.
 import torch
-from fairscale.optim.oss import OSS
+
+try:
+    from fairscale.optim.oss import OSS
+except (ImportError, ModuleNotFoundError):
+    OSS = None
+
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.autograd import Variable
 
@@ -63,9 +68,7 @@ class BF16Optimizer(torch.optim.Optimizer):
         self.fp32_from_fp16_groups = []
         self.fp32_from_fp32_groups = []
 
-        for i, param_group in enumerate(
-            self.optimizer.optim.param_groups if isinstance(self.optimizer, OSS) else self.optimizer.param_groups
-        ):
+        for i, param_group in enumerate(self.param_groups):
             fp16_params_this_group = []
             fp32_params_this_group = []
             fp32_from_fp16_params_this_group = []
@@ -262,4 +265,8 @@ class BF16Optimizer(torch.optim.Optimizer):
 
     @property
     def param_groups(self):
-        return self.optimizer.optim.param_groups if isinstance(self.optimizer, OSS) else self.optimizer.param_groups
+        return (
+            self.optimizer.optim.param_groups
+            if OSS is not None and isinstance(self.optimizer, OSS)
+            else self.optimizer.param_groups
+        )

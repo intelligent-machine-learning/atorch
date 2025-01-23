@@ -2,7 +2,11 @@ import copy
 import unittest
 
 import torch
-from fairscale.optim.oss import OSS
+
+try:
+    from fairscale.optim.oss import OSS
+except (ImportError, ModuleNotFoundError):
+    OSS = None
 
 import atorch
 from atorch.distributed.distributed import reset_distributed
@@ -61,7 +65,7 @@ class BF16OptimizerTest(unittest.TestCase):
         self.assertEqual(bf_16_finetune_optimizer.fp32_from_fp16_groups[0][0].grad.sum(), 0)
         self.assertEqual(sum([p.grad.sum() for p in model1.parameters()]), 0)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "run on gpu")
+    @unittest.skipIf(not torch.cuda.is_available() or OSS is None, "run on gpu with fairscale installed.")
     def test_bf16_finetune_oss_optimizer(self):
         atorch.init_distributed("nccl")
 

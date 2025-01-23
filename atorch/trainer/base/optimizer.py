@@ -1,10 +1,8 @@
 import torch.optim
 from torch.optim import Optimizer
 
-from atorch.trainer.base.inferface import Stateful
 
-
-class AtorchOptimizer(Optimizer, Stateful):
+class AtorchOptimizer(Optimizer):
     def __init__(self, optimizer: Optimizer, scaler):
         self.optimizer = optimizer
         self.scaler = scaler
@@ -32,12 +30,6 @@ class AtorchOptimizer(Optimizer, Stateful):
             optimizer = torch.optim.AdamW(configs)
 
         return optimizer
-
-    def state_dict(self, *args, **kwargs):
-        raise NotImplementedError
-
-    def load_state_dict(self, *args, **kwargs):
-        raise NotImplementedError
 
     def zero_grad(self, set_to_none=True):
         pass

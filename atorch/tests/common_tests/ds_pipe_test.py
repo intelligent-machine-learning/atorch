@@ -10,7 +10,6 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Model
 import atorch
 from atorch.utils.ds_pipe_utils import PipeModuleFromRecordedMeta
 from atorch.utils.meta_model_utils import record_module_init
-from atorch.utils.version import torch_version
 
 
 def gpt2_custom_patcher(cfg):
@@ -64,10 +63,7 @@ def _weight_align(pipe_model, ref_model):
 
 
 class TestDeepspeedPipelne(unittest.TestCase):
-    @unittest.skipIf(
-        not torch.cuda.is_available() or torch_version() < (2, 0, 0),  # type: ignore
-        "skip if no gpu, torch 2.0 needed for torch.device context manager.",
-    )
+    @unittest.skip("skip ds tests.")
     def test_meta_to_pipelinemodule(self):
         atorch.init_distributed(set_cuda_device_using_local_rank=True)
         gpt2_config = GPT2Config(

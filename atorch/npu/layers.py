@@ -81,7 +81,7 @@ def npu_fa_supported_startpoint_endpoint_mask(q, k, v, glm_mask, kwargs):
 def npu_fa_supported_breakpoint_mask(q, k, v, atten_mask, prefix, kwargs):
     _, _, nh_q, _ = q.shape
     kwargs["prefix"] = prefix
-    kwargs["atten_mask"] = (1.0 - atten_mask).bool()
+    kwargs["atten_mask"] = ~(atten_mask.bool())
     kwargs["sparse_mode"] = 5
     kwargs["next_tockens"] = 0  # must set this value
 
@@ -199,13 +199,9 @@ def npu_fa_with_glm_mask(
     if s_q % modulo != 0:
         pad_seqlen = (s_q + modulo - 1) // modulo * modulo
 
-        pad_q = torch.zeros([b, pad_seqlen, nh_q, hs], dtype=pad_dtype, device=pad_device)
-        pad_k = torch.zeros([b, pad_seqlen, nh_k, hs], dtype=pad_dtype, device=pad_device)
-        pad_v = torch.zeros([b, pad_seqlen, nh_v, hs], dtype=pad_dtype, device=pad_device)
-
-        pad_q[:, :s_q, :, :] = q
-        pad_k[:, :s_k, :, :] = k
-        pad_v[:, :s_v, :, :] = v
+        pad_q = torch.cat([q, torch.zeros([b, pad_seqlen - s_q, nh_q, hs], dtype=pad_dtype, device=pad_device)], dim=1)
+        pad_k = torch.cat([k, torch.zeros([b, pad_seqlen - s_k, nh_k, hs], dtype=pad_dtype, device=pad_device)], dim=1)
+        pad_v = torch.cat([v, torch.zeros([b, pad_seqlen - s_v, nh_v, hs], dtype=pad_dtype, device=pad_device)], dim=1)
         need_padding = True
     else:
         pad_q = q
@@ -289,7 +285,7 @@ def npu_fa_with_glm_mask(
                 pad_v.contiguous(),
                 nh_q,
                 kwargs["input_layout"],
-                atten_mask=(1.0 - pad_m).bool(),
+                atten_mask=~(pad_m.bool()),
                 pse=None,
                 padding_mask=None,
                 scale=kwargs["scale"],

@@ -20,6 +20,9 @@ class RecvBuffer(metaclass=SingletonMeta):
     def get(self, meta_id: str):
         return self._buffer[meta_id]
 
+    def all_meta_ids(self):
+        return self._buffer.keys()
+
 
 def _broadcast_tensor_list(
     tensor_list: List[torch.Tensor],
@@ -483,3 +486,10 @@ class PipeCommunicator:
             return None
 
         return torch.distributed.batch_isend_irecv(p2p_ops).pop()
+
+    def clear_recv_buffer_grad(self):
+        for meta_id in RecvBuffer().all_meta_ids():
+            buffers = RecvBuffer().get(meta_id)
+            for buffer in buffers:
+                if isinstance(buffer, torch.Tensor):
+                    buffer.grad = None

@@ -9,7 +9,12 @@ from atorch.auto.opt_lib.parallel_mode_optimization import AutoDDPOptimization, 
 from atorch.auto.opt_lib.pipeline_parallel_optimization import PipelineParallelOptimization
 from atorch.auto.opt_lib.sequence_parallel_optimization import SequenceParallelOptimization
 from atorch.auto.opt_lib.tensor_parallel_optimization import TensorParallelOptimization
-from atorch.auto.opt_lib.zero_optimization import FSDPOptimization, Zero1Optimization, Zero2Optimization
+from atorch.auto.opt_lib.zero_optimization import (
+    FSDP2Optimization,
+    FSDPOptimization,
+    Zero1Optimization,
+    Zero2Optimization,
+)
 from atorch.common.log_utils import default_logger as logger
 
 SEMIAUTO_STRATEGIES = ("tensor_parallel", "mixed_parallel", "pipeline_parallel")
@@ -42,6 +47,7 @@ class OptimizationLibrary(object):
             Zero1Optimization,
             Zero2Optimization,
             FSDPOptimization,
+            FSDP2Optimization,
             ParallelModeOptimization,
             AutoDDPOptimization,
             AmpNativeOptimization,

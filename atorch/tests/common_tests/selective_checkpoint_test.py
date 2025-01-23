@@ -34,9 +34,9 @@ def boot_test(rank, number_layers, pipes, mode):
             super().__init__()
             self.linears = torch.nn.ModuleList([get_llama_decoder_layer(llama_config) for i in range(number_layers)])
 
-        def forward(self, x):
+        def forward(self, x, position_ids=None):
             for layer in self.linears:
-                x = layer(x)[0]
+                x = layer(x, position_ids=position_ids)[0]
             return x
 
     dtype = torch.bfloat16
@@ -92,11 +92,12 @@ def boot_test(rank, number_layers, pipes, mode):
     loss_fn = torch.nn.CrossEntropyLoss()
     loss_fn = torch.nn.MSELoss()
     inp = torch.randn(b, seq, h).cuda().bfloat16() + rank / 10.0
+    position_ids = torch.arange(seq).cuda().repeat(b, 1)
     target = torch.empty(b, seq, h, dtype=torch.bfloat16).fill_(0.0).cuda()
     losses = []
-    for i in range(5):
+    for _ in range(5):
         opt.zero_grad()
-        logits = model(inp)
+        logits = model(inp, position_ids=position_ids)
         loss = loss_fn(logits, target)
         loss.backward()
         opt.step()

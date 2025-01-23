@@ -1377,6 +1377,28 @@ class TestFlashAttn(unittest.TestCase):
             start_timer()
             end_timer_and_print("")
 
+    def test_keep_requires_grad(self):
+        class Module(torch.nn.Module):
+            def __init__(self, nlayers):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([torch.nn.Linear(128, 128) for i in range(nlayers)])
+
+            def forward(self, x):
+                return self.layers(x)
+
+        class Layer2(torch.nn.Linear):
+            def forward(self, x):
+                return super().forward(x) + 1.0
+
+        module = Module(3)
+        for name, p in module.named_parameters():
+            if "bias" in name:
+                p.requires_grad = False
+        new_module = replace_module(module, torch.nn.Linear, Layer2, init_from_attr=True, strict=False)
+        for name, p in new_module.named_parameters():
+            if "bias" in name:
+                self.assertFalse(p.requires_grad)
+
 
 if __name__ == "__main__":
     unittest.main()

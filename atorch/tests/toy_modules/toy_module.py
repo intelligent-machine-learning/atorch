@@ -36,9 +36,9 @@ def get_gpt2_module_type(module="block"):
 
 
 class ToyCustomModule(nn.Module):
-    def __init__(self, in_features=16, out_features=4):
+    def __init__(self, in_features=16, out_features=4, layer_num=8):
         super().__init__()
-        self.linears = torch.nn.ModuleList([nn.Linear(out_features, out_features) for _ in range(8)])
+        self.linears = torch.nn.ModuleList([nn.Linear(out_features, out_features) for _ in range(layer_num)])
 
     def forward(self, inputs, test_kwargs=True):
         for op in self.linears:
@@ -47,7 +47,7 @@ class ToyCustomModule(nn.Module):
 
 
 class ToyModel(nn.Module):
-    def __init__(self, in_features=16, out_features=4, use_custom_module=False):
+    def __init__(self, in_features=16, out_features=4, use_custom_module=False, layer_num=8):
         """
         Args:
             in_feature (int): size of input feature.
@@ -57,9 +57,9 @@ class ToyModel(nn.Module):
         self.use_custom_module = use_custom_module
         self.linear = torch.nn.Linear(in_features, out_features)
         if use_custom_module:
-            self.linears = ToyCustomModule(in_features, out_features)
+            self.linears = ToyCustomModule(in_features, out_features, layer_num=layer_num)
         else:
-            self.linears = torch.nn.ModuleList([nn.Linear(out_features, out_features) for _ in range(8)])
+            self.linears = torch.nn.ModuleList([nn.Linear(out_features, out_features) for _ in range(layer_num)])
 
     def forward(self, inputs):
         data = self.linear(inputs[0])
@@ -345,7 +345,7 @@ class ToyLlamaChunk(LlamaModel):
         return hidden_states
 
 
-def get_llama_model_chunk(model_config, layer_num=None, pre_process=True, post_process=True):
+def get_llama_model_chunk(model_config, layer_num=None, pre_process=True, post_process=True, start_layer_idx=None):
     return ToyLlamaChunk(config=model_config, layer_num=layer_num, pre_process=pre_process, post_process=post_process)
 
 
@@ -444,6 +444,7 @@ def run_train(
     input_dtype=torch.float32,
     gpt2_model=False,
     use_optim_backward=False,
+    inspector=None,
 ):
     for idx, data in enumerate(dataloader):
         pdata = prepare_input(data, device)
@@ -460,4 +461,6 @@ def run_train(
         else:
             loss.backward()
         optim.step()
+        if inspector is not None:
+            inspector.step()
     return idx + 1

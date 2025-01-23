@@ -45,6 +45,9 @@ if is_torch_npu_available():
 else:
     from atorch.kernels import gmm
 
+    if gmm is None:
+        logger.error("grouped_gemm not insalled!")
+
 
 class MOEContext(metaclass=SingletonMeta):
     MOE_ALL2ALL_OVERLAP_BACKWARD = False
@@ -378,6 +381,9 @@ class Grouped_GEMM_MoE(torch.nn.Module):
                         "MegaBlocks implementation_type not supported yet for npu,\
                             using Megatron implementation type instead"
                     )
+        elif self.implementer_type == MOEImplmenterType.MegaBlocks and ops is None:
+            logger.error("Cannot use MegaBlocks as implementation type as megablocks is not installed!")
+
         if self.implementer_type is MOEImplmenterType.Megatron and use_bias:
             use_bias = False
             if rank() is None or rank() == 0:
@@ -619,6 +625,9 @@ class Grouped_GEMM_MoE(torch.nn.Module):
         se_fn2: Optional[Callable] = None,
         se_fn2_additional_input: Optional[Union[torch.Tensor, Tuple, List]] = None,
     ):
+        if torch.is_autocast_enabled():
+            expert_weights = expert_weights.to(torch.get_autocast_gpu_dtype())
+
         if self.implementer_type is MOEImplmenterType.Megatron:
             return self._forward_megatron(
                 hidden_states, expert_weights, top_experts, se_fn1, se_fn2, se_fn2_additional_input
@@ -806,6 +815,8 @@ class Grouped_GEMM_MoE(torch.nn.Module):
 
         # Compute expert
         if _hidden_states.nelement() == 0:
+            if EnvSetting().DEBUG:
+                logger.info(f"Rank {rank()} has not received any tokens for its expert.")
             # no valid token per expert & permuted local hidden states
             if not is_torch_npu_available():
                 assert _tokens_per_expert.sum(dim=0) == 0

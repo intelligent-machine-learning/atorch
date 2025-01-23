@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from atorch.common.util_func import recursively_apply
+from atorch.distributed.distributed import is_pipe_first_stage, is_pipe_last_stage
 
 
 def fast_batch_copy(data):
@@ -41,3 +42,18 @@ def expand_batch_dim(data, batch_size=1):
         return data.expand(*shape_list)
 
     return recursively_apply(expand, data, batch_size=batch_size, error_on_other_type=False)
+
+
+def get_batch(data_iterator):
+    if (not is_pipe_first_stage(ignore_virtual=True)) and (not is_pipe_last_stage(ignore_virtual=True)):
+        return None
+
+    # TODO:
+    # considier tp and cp
+
+    if data_iterator is not None:
+        batch = next(data_iterator)
+    else:
+        batch = None
+
+    return batch

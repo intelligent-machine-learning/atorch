@@ -108,6 +108,7 @@ def run_module_gt(rank, world_size, hidden_size, asynced=False):
         path = f"/tmp/fsdp_speedup_init_test/{world_size}/gt"
         save_fsdp_flat_param(model, path)
         save_fsdp_optim_param(model, optim, path)
+    atorch.reset_distributed()
 
 
 def run_module_reshard(rank, world_size, ckpt_path, hidden_size, test_dir_prefix, asynced=False):
@@ -143,6 +144,7 @@ def run_module_reshard(rank, world_size, ckpt_path, hidden_size, test_dir_prefix
         path = f"/tmp/fsdp_speedup_init_test/{test_dir_prefix}/reshard/{world_size}"
         save_fsdp_flat_param(model, path)
         save_fsdp_optim_param(model, optim, path)
+    atorch.reset_distributed()
 
 
 class FSDPShardSaveLoadTestSpeedInit(unittest.TestCase):
@@ -155,9 +157,6 @@ class FSDPShardSaveLoadTestSpeedInit(unittest.TestCase):
         if os.path.exists("/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}"):
             shutil.rmtree("/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}")
         self._prepare_toy_save()
-
-    def setUp(self):
-        atorch.reset_distributed()
 
     def _prepare_toy_save(self):
         """This test will save toy module"""
@@ -173,7 +172,6 @@ class FSDPShardSaveLoadTestSpeedInit(unittest.TestCase):
             daemon=False,
             start_method="spawn",
         )
-        atorch.reset_distributed()
 
     @unittest.skipIf(
         not torch.cuda.is_available() or torch.cuda.device_count() < 4,
@@ -181,7 +179,6 @@ class FSDPShardSaveLoadTestSpeedInit(unittest.TestCase):
     )
     def test_toy_load(self):
         """This test will load toy module"""
-
         # generate flat param ckpt
         def boot_inner(world_size):
             os.environ["WORLD_SIZE"] = str(world_size)
@@ -196,7 +193,6 @@ class FSDPShardSaveLoadTestSpeedInit(unittest.TestCase):
                 daemon=False,
                 start_method="spawn",
             )
-            atorch.reset_distributed()
 
         def load(ckpt_path):
             util = ShardTensorUtil(ckpt_path, 0, 1, device="cpu")
@@ -265,19 +261,16 @@ class FSDPShardSaveLoadTestSpeedInit(unittest.TestCase):
                 test_inner(rank, world_size, self.hidden_size)
 
 
+@pytest.mark.core24
 class FSDPShardAsyncSaveLoadTest(unittest.TestCase):
     def __init__(self, methodName="runTest", world_size=None, hidden_size=None):
         super(FSDPShardAsyncSaveLoadTest, self).__init__(methodName)
         self.world_size = world_size or 4
         self.hidden_size = hidden_size or 64
         self.test_dir_prefix = str(self.world_size)
-        self.gt_ckpt = f"/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}/gt"
+        self.gt_ckpt = f"/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}/async_gt"
         if os.path.exists("/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}"):
             shutil.rmtree("/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}")
-        self._prepare_toy_save()
-
-    def setUp(self):
-        atorch.reset_distributed()
 
     def _prepare_toy_save(self):
         """This test will save toy module"""
@@ -294,7 +287,6 @@ class FSDPShardAsyncSaveLoadTest(unittest.TestCase):
             daemon=False,
             start_method="spawn",
         )
-        atorch.reset_distributed()
 
     @unittest.skipIf(
         not torch.cuda.is_available() or torch.cuda.device_count() < 4,
@@ -302,6 +294,7 @@ class FSDPShardAsyncSaveLoadTest(unittest.TestCase):
     )
     def test_toy_load(self):
         """This test will load toy module"""
+        self._prepare_toy_save()
 
         # generate flat param ckpt
         def boot_inner(world_size):
@@ -318,7 +311,6 @@ class FSDPShardAsyncSaveLoadTest(unittest.TestCase):
                 daemon=False,
                 start_method="spawn",
             )
-            atorch.reset_distributed()
 
         def load(ckpt_path):
             util = ShardTensorUtil(ckpt_path, 0, 1, device="cpu")
@@ -332,13 +324,15 @@ class FSDPShardAsyncSaveLoadTest(unittest.TestCase):
         loaded_state_dict = []
         for shard in shard_numbers:
             boot_inner(shard)
-            loaded_state_dict.append(load(f"/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}/reshard/{shard}"))
+            loaded_state_dict.append(load(f"/tmp/fsdp_speedup_init_test/{self.test_dir_prefix}/reshard/{shard}/async"))
         gt_state_dict = load(self.gt_ckpt)
         for state_dict in loaded_state_dict:
             for name, gt_value in gt_state_dict.items():
                 # only save/load, all values should be equal.
                 self.assertTrue((gt_value == state_dict[name]).all())
 
+
+class FSDPPatchTest(unittest.TestCase):
     @unittest.skipIf(torch.cuda.is_available(), "skip gpu test as cpu test is enough")
     def test_fsdp_ignore_rank_check(self):
         from atorch.utils.fsdp_init_util import fsdp_ignore_rank_check
@@ -355,8 +349,6 @@ def _test_generator(world_size, hidden):
     TestClass.__name__ = f"FSDPShardSaveLoadTestSpeedInit_{world_size}_{hidden}"
     return TestClass
 
-
-FSDPShardSaveLoadTestSpeedInit_4_64 = _test_generator(4, 64)
 
 if torch.cuda.device_count() == 8:
     FSDPShardSaveLoadTestSpeedInit_7_97 = _test_generator(7, 97)

@@ -5,7 +5,7 @@ import re
 import types
 
 try:
-    from collections import abs as collections_abc  # type: ignore[attr-defined]
+    from collections import abc as collections_abc  # type: ignore[attr-defined]
 except ImportError:
     import collections as collections_abc  # type: ignore[no-redef]
 
@@ -28,6 +28,7 @@ from atorch.data import ShmDataloader, expand_batch_dim, get_sample_batch
 from atorch.distributed.distributed import (
     get_data_partition_rank_and_size,
     local_rank,
+    parallel_group,
     parallel_group_and_ranks,
     parallel_group_size,
     rank,
@@ -396,6 +397,9 @@ class ModelContext(object):
                 src = ranks[0]
             torch.distributed._broadcast_coalesced(process_group, module_states, int(250 * 1024 * 1024), src)
 
+        if "fsdp2" in self.pre_wrappers and parallel_group("expert") is not None:
+            self.optim_args["foreach"] = False
+
         if not self.check_pipe_model():
             if not self.optim_param_func:
                 optim = self.optim_func(self.model.parameters(), **self.optim_args)
@@ -416,6 +420,7 @@ class ModelContext(object):
             and "ds_zero" not in self.post_wrappers
             and "zero2" not in self.post_wrappers
             and "fsdp" not in self.pre_wrappers
+            and "fsdp2" not in self.pre_wrappers
             and "ds_3d_parallel" not in self.post_wrappers
         ):
             is_cuda = next(self.model.parameters()).is_cuda
@@ -497,6 +502,8 @@ class ModelContext(object):
                 self.pre_wrappers.pop("zero2")
             if "fsdp" in self.pre_wrappers:
                 self.pre_wrappers.pop("fsdp")
+            if "fsdp2" in self.pre_wrappers:
+                self.pre_wrappers.pop("fsdp2")
 
             # DDP is supported and handled internally by PiPPy.
             if "ddp" in self.post_wrappers:
@@ -572,13 +579,18 @@ class ModelContext(object):
         ds_3d_parallel_wrapper_exist = "ds_3d_parallel" in self.post_wrappers
         fairscale_zero2_wrapper_exist = "zero2" in self.post_wrappers
         fsdp_wrapper_exist = "fsdp" in self.pre_wrappers or "zero2" in self.pre_wrappers
+        fsdp2_wrapper_exist = "fsdp2" in self.pre_wrappers
         tensor_parallel_wrapper_exist = "tp" in self.pre_wrappers
         ckpt_wrapper_exist = "checkpoint" in self.post_wrappers
         native_dynamo_wrapper_exist = "native_dynamo" in self.pre_wrappers
 
         # remove ddp wrapper when using zero2
         if ddp_wrapper_exist and (
-            fairscale_zero2_wrapper_exist or fsdp_wrapper_exist or ds_zero_wrapper_exist or ds_3d_parallel_wrapper_exist
+            fairscale_zero2_wrapper_exist
+            or fsdp_wrapper_exist
+            or ds_zero_wrapper_exist
+            or ds_3d_parallel_wrapper_exist
+            or fsdp2_wrapper_exist
         ):
             logger.info("Found Zero, ds_3d_parallel, or pipe wrapper, remove ddp wrapper.")
             self.post_wrappers.pop("ddp")
@@ -587,21 +599,28 @@ class ModelContext(object):
             logger.info("Found fsdp and amp_native wrapper, turn on mixed_precision in FSDP")
             _, amp_native_config = self.post_wrappers["amp_native"]
             fp16_dtype = amp_native_config.get("dtype", torch.float16)
-            mixed_precision_param = (
-                MixedPrecision(param_dtype=fp16_dtype, reduce_dtype=fp16_dtype, buffer_dtype=fp16_dtype)
-                if MixedPrecision
-                else True
-            )
+            mixed_precision_param = {"param_dtype": fp16_dtype, "reduce_dtype": fp16_dtype, "buffer_dtype": fp16_dtype}
             config = self.pre_wrappers["fsdp"][1] or {}
             config["mixed_precision"] = mixed_precision_param
             self.pre_wrappers["fsdp"] = (
                 self.pre_wrappers["fsdp"][0],
                 config,
             )
+        elif fsdp2_wrapper_exist and "amp_native" in self.post_wrappers:
+            logger.info("Found fsdp2 and amp_native wrapper, turn on mixed_precision in FSDP")
+            _, amp_native_config = self.post_wrappers["amp_native"]
+            fp16_dtype = amp_native_config.get("dtype", torch.float16)
+            mixed_precision_param = {"param_dtype": fp16_dtype, "reduce_dtype": fp16_dtype, "buffer_dtype": fp16_dtype}
+            config = self.pre_wrappers["fsdp2"][1] or {}
+            config["mixed_precision"] = mixed_precision_param
+            self.pre_wrappers["fsdp2"] = (
+                self.pre_wrappers["fsdp2"][0],
+                config,
+            )
 
         # move dynamo_native wrapper behind ddp or fsdp (fsdp will adjusted later)
         # Note that dynamo_native wrapper and fsdp wrapper are pre-wrappers while ddp wrapper is a post-wrapper.
-        if native_dynamo_wrapper_exist and ddp_wrapper_exist and not fsdp_wrapper_exist:
+        if native_dynamo_wrapper_exist and ddp_wrapper_exist and not fsdp_wrapper_exist and not fsdp2_wrapper_exist:
             # ddp wrapper is a post-wrapper. Popping dynamo_native wrapper from pre-wrappers
             # then insert it after ddp wrapper.
             post_wrappers_list = []
@@ -616,8 +635,13 @@ class ModelContext(object):
 
         if tensor_parallel_wrapper_exist:
             wrap_cls = None
+            fsdp_wrapper = None
             if fsdp_wrapper_exist and torch_version() >= (1, 12, 0):
                 fsdp_wrapper = self.pre_wrappers["fsdp"]
+            elif fsdp2_wrapper_exist and torch_version() >= (1, 12, 0):
+                fsdp_wrapper = self.pre_wrappers["fsdp2"]
+
+            if fsdp_wrapper is not None:
                 fsdp_wrapper = list(fsdp_wrapper)
                 if fsdp_wrapper[1] is None:
                     fsdp_wrapper[1] = dict()
@@ -644,7 +668,7 @@ class ModelContext(object):
             leaf_modules = _propose_leaf_modules(wrap_cls)
             auto_wrap_cls = _propose_wrap_cls(leaf_modules)
 
-            if fsdp_wrapper_exist and torch_version() >= (1, 12, 0):
+            if (fsdp_wrapper_exist or fsdp2_wrapper_exist) and torch_version() >= (1, 12, 0):
                 if "atorch_wrap_cls" in fsdp_config:
                     if auto_wrap_cls is not None:
                         fsdp_config["atorch_wrap_cls"] = auto_wrap_cls
@@ -652,7 +676,11 @@ class ModelContext(object):
                         fsdp_config.pop("atorch_wrap_cls")
 
                     fsdp_wrapper[1] = fsdp_config
-                    self.pre_wrappers["fsdp"] = tuple(fsdp_wrapper)
+
+                    if fsdp_wrapper_exist:
+                        self.pre_wrappers["fsdp"] = tuple(fsdp_wrapper)
+                    elif fsdp2_wrapper_exist:
+                        self.pre_wrappers["fsdp2"] = tuple(fsdp_wrapper)
 
             if ckpt_wrapper_exist:
                 if auto_wrap_cls is not None:
@@ -671,7 +699,7 @@ class ModelContext(object):
             tensor_parallel_wrapper_item = list(tensor_parallel_wrapper_item)
             tensor_parallel_wrapper_item[1] = list(tensor_parallel_wrapper_item[1])
             tensor_parallel_wrapper_item[1][1]["leaf_modules"] = leaf_modules
-            if fsdp_wrapper_exist or pipe_wrapper_exist:
+            if fsdp_wrapper_exist or fsdp2_wrapper_exist or pipe_wrapper_exist:
                 tensor_parallel_wrapper_item[1][1]["defer_init"] = True
             tensor_parallel_wrapper_item[1] = tuple(tensor_parallel_wrapper_item[1])
             tensor_parallel_wrapper_item = tuple(tensor_parallel_wrapper_item)
@@ -687,7 +715,7 @@ class ModelContext(object):
                 _insert_amp_config_for_tp_ckpt(amp_config)
 
         # adjust pre_wrapper order
-        order_wrapper_name = ["half", "module_replace", "sequence_parallel", "fp8", "fsdp", "native_dynamo"]
+        order_wrapper_name = ["half", "module_replace", "sequence_parallel", "fp8", "fsdp", "fsdp2", "native_dynamo"]
         match_names = []
         for name in self.pre_wrappers:
             if name in order_wrapper_name:

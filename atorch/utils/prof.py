@@ -13,7 +13,6 @@ from torch.nn import Module
 import atorch
 from atorch.common.constants import AnalyserConstants, GPUCapability
 from atorch.common.log_utils import default_logger as logger
-from atorch.kernels import AtorchLayerNormFunc
 from atorch.utils.hooks import ATorchHooks
 
 try:
@@ -870,6 +869,8 @@ def _patch_functionals():
         )
     except (ImportError, ModuleNotFoundError):
         pass
+    from atorch.kernels import AtorchLayerNormFunc
+
     AtorchLayerNormFunc.apply = _wrap_func(AtorchLayerNormFunc.apply, _layer_norm_flops_compute, "AtorchLayerNormFunc")
     if hasattr(F, "scaled_dot_product_attention"):
         F.scaled_dot_product_attention = _wrap_func(
@@ -948,6 +949,8 @@ def _reload_functionals():
         FusedLayerNormFunction.apply = GlobalContext.old_functions["FusedLayerNormFunction"]
     except (ImportError, ModuleNotFoundError):
         pass
+
+    from atorch.kernels import AtorchLayerNormFunc
 
     AtorchLayerNormFunc.apply = GlobalContext.old_functions["AtorchLayerNormFunc"]
     if "scaled_dot_product_attention" in GlobalContext.old_functions:

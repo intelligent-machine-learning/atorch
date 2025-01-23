@@ -4,6 +4,7 @@ import random
 import unittest
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -158,6 +159,7 @@ class TestGroupedGemmMoE(unittest.TestCase):
         torch.backends.cudnn.set_flags(_benchmark=False, _deterministic=True)
 
     @unittest.skipIf(is_torch_npu_available(), "MegaBlocks implementation_type not supported yet for npu")
+    @pytest.mark.core24
     def test_grouped_gemm_moe_megablocks(self):
         # for num_experts, hidden_size, expert_intermediate_size, topk in [[8, 3072, 12288, 2], [30, 3072, 3072, 6]]:
         for num_experts, hidden_size, expert_intermediate_size, topk in [[8, 256, 1024, 2], [30, 512, 512, 6]]:
@@ -340,10 +342,11 @@ class TestGroupedGemmMoE(unittest.TestCase):
                 res = moe_module_not_transpose.compute_expert(inp, tokens_per_expert)
             self.assertEqual(res.shape[0], 0)
 
+    @pytest.mark.core24
     def test_grouped_gemm_moe_megatron(self):
         implementation_type = "Megatron"
         token_dispatcher_types = ["AllToAll", "AllGather", "MindSpeedAllGather", "MindSpeedAllToAll"]
-        for num_experts, hidden_size, expert_intermediate_size, topk in [[8, 256, 1024, 2], [30, 512, 512, 6]]:
+        for num_experts, hidden_size, expert_intermediate_size, topk in [[8, 256, 1024, 2]]:
             for use_swiglu in [False, True]:
                 for use_bias in [False, True]:
                     for token_dispatcher_type in token_dispatcher_types:

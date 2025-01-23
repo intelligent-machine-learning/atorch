@@ -1,6 +1,7 @@
 import os
 import unittest
 
+import pytest
 import torch
 import torch.multiprocessing as mp
 
@@ -8,6 +9,8 @@ import atorch
 from atorch.common.util_func import find_free_port
 from atorch.communication.pipe_communicator import PipeCommunicator, RecvBuffer
 from atorch.distributed.distributed import create_parallel_group, pipe_next_rank, pipe_prev_rank
+
+pytestmark = pytest.mark.core24
 
 
 def _create_pipe_group(rank):

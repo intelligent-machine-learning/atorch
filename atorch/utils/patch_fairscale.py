@@ -6,8 +6,13 @@ Patch _setup_flat_buffers in OSS and _add_param_as_view in ParamBucket for align
 """
 
 import torch
-from fairscale.nn.misc import ParamBucket
-from fairscale.optim.oss import OSS
+
+try:
+    from fairscale.nn.misc import ParamBucket
+    from fairscale.optim.oss import OSS
+except (ImportError, ModuleNotFoundError):
+    ParamBucket = None
+    OSS = None
 
 
 # Align param address to 16-byte
@@ -58,6 +63,10 @@ def patch_setup_flat_buffers(self) -> None:
 
 @torch.no_grad()
 def patch_add_param_as_view(self, param: torch.Tensor, keep_existing_value: bool = True) -> None:
+    if OSS is None:
+        # no fairscale, no patch.
+        return
+
     assert self.buffer is not None
     assert (
         param.dtype == self.buffer.dtype

@@ -151,7 +151,7 @@ def get_ds_dtype(ds_config):
     Args:
         ds_config (Union[str, dict]): deepspeed config
     """
-    if ds_config is None:
+    if ds_config is None or DeepSpeedConfig is None:
         return torch.float32
     ds_config = DeepSpeedConfig(ds_config)
     if ds_config.fp16_enabled:

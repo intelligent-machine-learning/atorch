@@ -3,12 +3,17 @@ import types
 from functools import partialmethod, wraps
 
 try:
-    from collections import abs as collections_abc  # type: ignore[attr-defined]
+    from collections import abc as collections_abc  # type: ignore[attr-defined]
 except ImportError:
     import collections as collections_abc  # type: ignore[no-redef]
 
 import torch
-from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
+
+try:
+    from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
+except (ImportError, ModuleNotFoundError):
+    ShardedDDP = None
+
 from torch.cuda.amp import GradScaler, autocast
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -22,7 +27,10 @@ if torch_version() >= (1, 12, 0):  # type: ignore
     from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
 else:
-    from fairscale.optim.grad_scaler import ShardedGradScaler
+    try:
+        from fairscale.optim.grad_scaler import ShardedGradScaler
+    except (ImportError, ModuleNotFoundError):
+        ShardedGradScaler = None
 
 from atorch.auto.auto_accelerate_context import AutoAccelerateContext
 from atorch.auto.opt_lib.optimization import Optimization
@@ -85,18 +93,25 @@ class AmpNativeOptimization(Optimization):
             parallel_group_data = parallel_group("data")
             parallel_group_zero = parallel_group("zero")
 
+            def _is_sharded_ddp(m):
+                return isinstance(m, FSDP) or (ShardedDDP is not None and isinstance(m, ShardedDDP))
+
             if wrapper_config["dtype"] == torch.bfloat16 and skip_if_nonfinite:
                 # Bf16 does not need loss scaling. We only need GradScaler's inf checking.
                 if parallel_group_zero is not None and parallel_group_data is not None:
                     grad_scaler = BF16ShardedGradScaler(process_group=parallel_group_zero)
-                elif parallel_group_data is not None and isinstance(model, (ShardedDDP, FSDP)):
+                elif parallel_group_data is not None and _is_sharded_ddp(model):
                     grad_scaler = BF16ShardedGradScaler(process_group=parallel_group_data)
                 else:
                     grad_scaler = BF16GradScaler()
             else:
+                if ShardedGradScaler is None:
+                    raise RuntimeError(
+                        "For pytorch < 1.12.0, amp_native are supported only when fairscale is installed."
+                    )
                 if parallel_group_zero is not None and parallel_group_data is not None:
                     grad_scaler = ShardedGradScaler(process_group=parallel_group_zero)
-                elif parallel_group_data is not None and isinstance(model, (ShardedDDP, FSDP)):
+                elif parallel_group_data is not None and _is_sharded_ddp(model):
                     grad_scaler = ShardedGradScaler(process_group=parallel_group_data)
                 else:
                     grad_scaler = GradScaler()
@@ -219,12 +234,18 @@ class Fp8Optimization(Optimization):
     def apply_wrapper(model_context, wrapper_name, wrapper_config=None):
         """config:
         include: List[str], default None.
-            If None, all nn.Linear module would use te.
+            If None, all nn.Linear module would use fp8.
             If not None, nn.Linear module's name should have at least one substring equals to items in include.
         exclude: List[str], default None.
             If None, all modules that passing include test would use te.
-            If not None, if a nn.Linear module's name has at least one substring matches exclude, it will not use te.
-        recipe.DelayedScaling's parameter:
+            If not None, if a nn.Linear module's name has at least one substring matches exclude, it will not use fp8.
+        precision_switchable: if True, can switch precison during training (fp8 <-> non-fp8). Default False.
+        precision_switchable_fp8_input_current_scaling: if use current scaling when use precision_switchable.
+        use_te: if True, use te.Linear for fp8 implementation. If False, use atorch ScaledLinear. Default True.
+        scale_method: scale method used for ScaledLinear. "tensorwise", "axiswise", "tileblock". default "tensorwise".
+        quantization_method: quantization method used for quantization.  "default", "pytorch", "fbgemm", "triton".
+        compute_method: compute method used for fp8 gemm. "default", "pytorch", "fbgemm", "triton", "cuda".
+        recipe.DelayedScaling's parameter (only applicable when use_te):
             margin: default 0
             interval (te < 1.8): default 1
             fp8_format: "HYBRID" (default) or "E4M3"
@@ -235,41 +256,53 @@ class Fp8Optimization(Optimization):
             fp8_dpa (te 1.6+), default False
             fp8_mha (te 1.6+), default False
         """
-        import transformer_engine.pytorch as te
-        from transformer_engine.common import recipe
-        from transformer_engine.pytorch.utils import check_dim_for_fp8_exec
 
         config = {} if wrapper_config is None else wrapper_config
         delayed_scaling_config = {}
         include = config.get("include", None)
         exclude = config.get("exclude", None)
-        delayed_scaling_config["margin"] = config.get("margin", 0)
-        if package_version_smaller_than("transformer_engine", "1.8"):
-            # valid only te version < 1.8, will be removed in future version.
-            delayed_scaling_config["interval"] = config.get("interval", 1)
-        fp8_format = config.get("fp8_format", "HYBRID").upper()
-        if fp8_format == "HYBRID":
-            fp8_format_type = recipe.Format.HYBRID
-        elif fp8_format == "E4M3":
-            fp8_format_type = recipe.Format.E4M3
-        else:
-            raise f"fp8_format only supports HYBRID and E4M3, not {fp8_format}"
-        delayed_scaling_config["fp8_format"] = fp8_format_type
-        delayed_scaling_config["amax_history_len"] = config.get("amax_history_len", 1024)
-        delayed_scaling_config["amax_compute_algo"] = config.get("amax_compute_algo", "max")
-        if hasattr(recipe.DelayedScaling, "override_linear_precision"):
-            delayed_scaling_config["override_linear_precision"] = config.get(
-                "override_linear_precision", (False, False, False)
-            )
-        delayed_scaling_config["reduce_amax"] = config.get("reduce_amax", True)
-        if hasattr(recipe.DelayedScaling, "fp8_dpa"):
-            delayed_scaling_config["fp8_dpa"] = config.get("fp8_dpa", False)
-        if hasattr(recipe.DelayedScaling, "fp8_mha"):
-            delayed_scaling_config["fp8_mha"] = config.get("fp8_mha", False)
+        precision_switchable = config.get("precision_switchable", False)
+        precision_switchable_fp8_input_current_scaling = config.get(
+            "precision_switchable_fp8_input_current_scaling", False
+        )
+        use_te = config.get("use_te", True)
+        scale_method = config.get("scale_method", "tensorwise")
+        scale_block_size = config.get("scale_block_size", 128)
+        quantization_method = config.get("quantization_method", "default")
+        compute_method = config.get("compute_method", "default")
+        from atorch.modules.fp8 import fp8_valid_shape_check
+
+        if use_te:
+            import transformer_engine.pytorch as te
+            from transformer_engine.common import recipe
+
+            delayed_scaling_config["margin"] = config.get("margin", 0)
+            if package_version_smaller_than("transformer_engine", "1.8"):
+                # valid only te version < 1.8, will be removed in future version.
+                delayed_scaling_config["interval"] = config.get("interval", 1)
+            fp8_format = config.get("fp8_format", "HYBRID").upper()
+            if fp8_format == "HYBRID":
+                fp8_format_type = recipe.Format.HYBRID
+            elif fp8_format == "E4M3":
+                fp8_format_type = recipe.Format.E4M3
+            else:
+                raise f"fp8_format only supports HYBRID and E4M3, not {fp8_format}"
+            delayed_scaling_config["fp8_format"] = fp8_format_type
+            delayed_scaling_config["amax_history_len"] = config.get("amax_history_len", 1024)
+            delayed_scaling_config["amax_compute_algo"] = config.get("amax_compute_algo", "max")
+            if hasattr(recipe.DelayedScaling, "override_linear_precision"):
+                delayed_scaling_config["override_linear_precision"] = config.get(
+                    "override_linear_precision", (False, False, False)
+                )
+            delayed_scaling_config["reduce_amax"] = config.get("reduce_amax", True)
+            if hasattr(recipe.DelayedScaling, "fp8_dpa"):
+                delayed_scaling_config["fp8_dpa"] = config.get("fp8_dpa", False)
+            if hasattr(recipe.DelayedScaling, "fp8_mha"):
+                delayed_scaling_config["fp8_mha"] = config.get("fp8_mha", False)
 
         verbose = config.get("verbose", False)
 
-        def check_if_replace(key, module, m_include, m_exclude):
+        def check_if_replace(key, module, m_include, m_exclude, check_block_size=None):
             # return (if_replace, if_excluded, if_shape_incompatible)
             if not isinstance(module, torch.nn.Linear):
                 return False, False, False
@@ -285,58 +318,130 @@ class Fp8Optimization(Optimization):
                         break
                 if not pass_check:
                     return False, False, False
-            # Backward computation would use transposed weight, so also check transposed weight shape.
-            transposed_shape = torch.Size(
-                [module.weight.shape[1], module.weight.shape[0]] + list(module.weight.shape[2:])
-            )
-            backward_weight = torch.empty(transposed_shape, device="meta")
-            if check_dim_for_fp8_exec(module.weight) and check_dim_for_fp8_exec(backward_weight):
+            shape_valid = fp8_valid_shape_check(module.weight.shape, check_block_size)
+
+            if shape_valid:
                 return True, False, False
             else:
                 return False, False, True
 
-        def get_te_module(module):
+        def get_fp8_module(
+            module,
+            use_te,
+            switchable,
+            fp8_input_current_scaling,
+            scale_method,
+            quantization_method,
+            compute_method,
+            scale_block_size,
+        ):
             config = {}
             new_module = None
+            has_bias = hasattr(module, "bias") and module.bias is not None
             if isinstance(module, torch.nn.Linear):
-                config["in_features"] = module.in_features
-                config["out_features"] = module.out_features
-                config["bias"] = hasattr(module, "bias") and module.bias is not None
-                config["params_dtype"] = module.weight.dtype
-                # te.Linear checks meta device by "meta" str, not torch.device. Thus, use str if meta.
-                if isinstance(module.weight.device, torch.device) and module.weight.device.type == "meta":
-                    config["device"] = "meta"
-                else:
-                    config["device"] = module.weight.device
-                new_module = te.Linear(**config)
-                with torch.no_grad():
-                    new_module.weight.copy_(module.weight)
-                    if hasattr(module.weight, "checkpoint_name"):
-                        value = getattr(module.weight, "checkpoint_name")
-                        setattr(new_module.weight, "checkpoint_name", value)
-                    del module.weight
-                    if config["bias"]:
-                        new_module.bias.copy_(module.bias)
-                        if hasattr(module.bias, "checkpoint_name"):
-                            value = getattr(module.bias, "checkpoint_name")
-                            setattr(new_module.bias, "checkpoint_name", value)
-                        del module.bias
+                need_copy_weight = True
+                if use_te:
+                    if switchable:
+                        from atorch.modules.fp8 import PrecisionSwitchableLinear
+
+                        new_module = PrecisionSwitchableLinear(
+                            in_features=module.in_features,
+                            out_features=module.out_features,
+                            bias=hasattr(module, "bias") and module.bias is not None,
+                            device=module.weight.device,
+                            dtype=module.weight.dtype,
+                            original_linear=module,
+                            init_precision="fp8",
+                            pre_cast_input_fp8_current_scaling=fp8_input_current_scaling,
+                        )
+                        # switchable shares weights, so no need to copy
+                        need_copy_weight = False
+                    else:
+                        config["in_features"] = module.in_features
+                        config["out_features"] = module.out_features
+                        config["bias"] = has_bias
+                        config["params_dtype"] = module.weight.dtype
+                        # te.Linear checks meta device by "meta" str, not torch.device. Thus, use str if meta.
+                        if isinstance(module.weight.device, torch.device) and module.weight.device.type == "meta":
+                            config["device"] = "meta"
+                        else:
+                            config["device"] = module.weight.device
+                        new_module = te.Linear(**config)
+                else:  # not use te
+                    from atorch.modules.fp8 import ScaledLinear
+                    from atorch.modules.fp8.quantize import get_quantize_params
+
+                    new_module = ScaledLinear(
+                        in_features=module.in_features,
+                        out_features=module.out_features,
+                        bias=hasattr(module, "bias") and module.bias is not None,
+                        device=module.weight.device,
+                        dtype=module.weight.dtype,
+                        quantize_params=get_quantize_params(
+                            scale_method, quantization_method, compute_method, scale_block_size
+                        ),
+                    )
+                new_module.weight.requires_grad = module.weight.requires_grad
+                if has_bias:
+                    new_module.bias.requires_grad = module.bias.requires_grad
+                if need_copy_weight:
+                    with torch.no_grad():
+                        new_module.weight.copy_(module.weight)
+                        if hasattr(module.weight, "checkpoint_name"):
+                            value = getattr(module.weight, "checkpoint_name")
+                            setattr(new_module.weight, "checkpoint_name", value)
+                        del module.weight
+                        if has_bias:
+                            new_module.bias.copy_(module.bias)
+                            if hasattr(module.bias, "checkpoint_name"):
+                                value = getattr(module.bias, "checkpoint_name")
+                                setattr(new_module.bias, "checkpoint_name", value)
+                            del module.bias
             return new_module
 
-        def replace_module_with_te(model, m_include, m_exclude):
+        def replace_module_with_fp8_module(
+            model,
+            m_include,
+            m_exclude,
+            use_te,
+            switchable,
+            fp8_input_current_scaling,
+            scale_method,
+            quantization_method,
+            compute_method,
+            scale_block_size=128,
+        ):
             replaced_num = 0
             exclude_num = 0
             shape_incompatible_num = 0
+            if scale_method == "tileblock":
+                check_block_size = (scale_block_size, scale_block_size)
+            else:
+                check_block_size = None
             for key, module in model.named_modules():
-                if_replace, if_exclude, if_shape_incompatible = check_if_replace(key, module, m_include, m_exclude)
+                if_replace, if_exclude, if_shape_incompatible = check_if_replace(
+                    key, module, m_include, m_exclude, check_block_size
+                )
                 if if_replace:
-                    new_module = get_te_module(module)
+                    new_module = get_fp8_module(
+                        module,
+                        use_te,
+                        switchable,
+                        fp8_input_current_scaling,
+                        scale_method,
+                        quantization_method,
+                        compute_method,
+                        scale_block_size,
+                    )
                     parent = model.get_submodule(".".join(key.split(".")[:-1]))
                     target_name = key.split(".")[-1]
                     setattr(parent, target_name, new_module)
                     replaced_num += 1
                     if verbose and atorch.local_rank() in (0, None):
-                        logger.info(f"Replacing {key} with te.Linear.")
+                        layer_name = (
+                            "PrecisionSwitchableLinear" if switchable else ("te.Linear" if use_te else "ScaledLinear")
+                        )
+                        logger.info(f"Replacing {key} with {layer_name}.")
                 if if_exclude:
                     exclude_num += 1
                 if if_shape_incompatible:
@@ -344,8 +449,17 @@ class Fp8Optimization(Optimization):
             return replaced_num, exclude_num, shape_incompatible_num
 
         # step 1: replace linear with te.Linear
-        te_module_num, te_exclude_num, te_shape_incompatible_num = replace_module_with_te(
-            model_context.model, include, exclude
+        te_module_num, te_exclude_num, te_shape_incompatible_num = replace_module_with_fp8_module(
+            model_context.model,
+            include,
+            exclude,
+            use_te,
+            precision_switchable,
+            precision_switchable_fp8_input_current_scaling,
+            scale_method,
+            quantization_method,
+            compute_method,
+            scale_block_size,
         )
         if te_module_num == 0:
             logger.warning(
@@ -355,38 +469,46 @@ class Fp8Optimization(Optimization):
             )
             return model_context
         else:
+            if not use_te:
+                module_name = "ScaledLinear"
+            else:
+                module_name = "PrecisionSwitchableLinear" if precision_switchable else "te.Linear"
             logger.info(
-                "[fp8] {} modules replaced by te.Linear, {} excluded, {} shape incompatible".format(
-                    te_module_num, te_exclude_num, te_shape_incompatible_num
+                "[fp8] {} modules replaced by {}, {} excluded, {} shape incompatible".format(
+                    te_module_num,
+                    module_name,
+                    te_exclude_num,
+                    te_shape_incompatible_num,
                 )
             )
 
-        # step 2: fp8_autocast forward, loss_func
-        fp8_recipe = recipe.DelayedScaling(**delayed_scaling_config)
+        # step 2: fp8_autocast forward, loss_func if use_te
+        if use_te:
+            fp8_recipe = recipe.DelayedScaling(**delayed_scaling_config)
 
-        ori_forward_func = model_context.model.forward
+            ori_forward_func = model_context.model.forward
 
-        def fp8_run_method(self, *args, **kargs):
-            # TODO: set fp8_group properly if reduce_amax is True and tp is used
-            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                return ori_forward_func(*args, **kargs)
-
-        model_context.model.forward = types.MethodType(fp8_run_method, model_context.model)
-
-        if model_context.loss_func is not None:
-            old_loss_func = model_context.loss_func
-
-            def fp8_run(*args, **kargs):
+            def fp8_run_method(self, *args, **kargs):
+                # TODO: set fp8_group properly if reduce_amax is True and tp is used
                 with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                    return old_loss_func(*args, **kargs)
+                    return ori_forward_func(*args, **kargs)
 
-            model_context.loss_func = fp8_run
+            model_context.model.forward = types.MethodType(fp8_run_method, model_context.model)
 
-        # step 3: record fp8_enabled for checkpoint optimization
-        if hasattr(AutoAccelerateContext, "fp8_enabled"):
-            AutoAccelerateContext.fp8_enabled.update({AutoAccelerateContext.counter: True})
-        else:
-            AutoAccelerateContext.add_ac_attr("fp8_enabled", {AutoAccelerateContext.counter: True})
+            if model_context.loss_func is not None:
+                old_loss_func = model_context.loss_func
+
+                def fp8_run(*args, **kargs):
+                    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                        return old_loss_func(*args, **kargs)
+
+                model_context.loss_func = fp8_run
+
+            # step 3: record fp8_enabled for checkpoint optimization if use_te (checkpoint will use te checkpoint)
+            if hasattr(AutoAccelerateContext, "fp8_enabled"):
+                AutoAccelerateContext.fp8_enabled.update({AutoAccelerateContext.counter: True})
+            else:
+                AutoAccelerateContext.add_ac_attr("fp8_enabled", {AutoAccelerateContext.counter: True})
 
         return model_context
 

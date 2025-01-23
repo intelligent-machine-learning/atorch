@@ -2,8 +2,6 @@ import argparse
 import time
 
 import torch
-from data import get_dataloader_args, get_dataset
-from modeling import ModelType, get_loss_func, get_model, get_model_input_format, get_model_type, get_module_type
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -11,7 +9,9 @@ import atorch
 from atorch.auto.accelerate import auto_accelerate
 from atorch.common.util_func import data_to_device
 from atorch.distributed.distributed import get_data_partition_rank_and_size
-from atorch.local_sgd.HSDP import LocalSGDConfigs, OuterOptimizerConfigs
+
+from .data import get_dataloader_args, get_dataset
+from .modeling import ModelType, get_loss_func, get_model, get_model_input_format, get_model_type, get_module_type
 
 
 def optim_grouped_param_func(model):
@@ -51,14 +51,6 @@ def parse_args():
     parser.add_argument("--use_fp8", default=False, action="store_true")
     parser.add_argument("--use_checkpointing", default=False, action="store_true")
     parser.add_argument("--use_module_replace", default=False, action="store_true")
-    # local sgd related
-    parser.add_argument("--use_local_sgd", default=False, action="store_true")
-    parser.add_argument("--use_async", default=False, action="store_true")
-    parser.add_argument("--local_sgd_sync_interval", type=int, default=1, required=False)
-    parser.add_argument("--local_sgd_sync_time", type=float, default=10.0, required=False)
-    parser.add_argument("--min_total_global_steps", type=int, default=10, required=False)
-    parser.add_argument("--local_sgd_warmup_steps", type=int, default=0, required=False)
-    parser.add_argument("--outer_optim_class", type=str, choices=["none", "sgd"], default="none", required=False)
     # if need to init torch_npu
     parser.add_argument("--npu", default=False, action="store_true")
 
@@ -112,14 +104,6 @@ def train(args):
     if args.load_strategy:
         # data parallel if distributed
         strategy = ["parallel_mode"] if args.distributed else []
-        if args.use_local_sgd:
-            device_counts = torch.cuda.device_count()
-            if device_counts < 4 or device_counts % 2:
-                raise RuntimeError(
-                    "If using local sgd, make sure the number of GPUs is an even number and not less than 4."
-                )
-            parallel_config = ([("zero", device_counts // 2), ("data", 2)], None)
-            strategy = [("parallel_mode", parallel_config)] if args.distributed else []
         # module_replace
         if torch.cuda.is_available() and args.use_module_replace:
             strategy.append("module_replace")
@@ -134,23 +118,6 @@ def train(args):
             # use_orig_params if grouped parameters are used in optim.
             if args.optim_grouped_params:
                 fsdp_config["use_orig_params"] = True
-            if args.use_local_sgd:
-                fsdp_config["use_local_sgd"] = True
-                fsdp_config["local_sgd_configs"] = LocalSGDConfigs(
-                    use_async=args.use_async,
-                    local_sgd_sync_interval=args.local_sgd_sync_interval,
-                    local_sgd_sync_time=args.local_sgd_sync_time,
-                    min_total_global_steps=args.min_total_global_steps,
-                    local_sgd_warmup_steps=args.local_sgd_warmup_steps,
-                )
-                fsdp_config["outer_optim_configs"] = OuterOptimizerConfigs(
-                    outer_optim_class=torch.optim.SGD if args.outer_optim_class == "sgd" else None,
-                    outer_optim_kwargs={
-                        "lr": 0.7,
-                        "momentum": 0.8,
-                        "nesterov": True,
-                    },
-                )
             strategy.append(("fsdp", fsdp_config))
         # mixed precision
         if torch.cuda.is_available() and args.use_amp:

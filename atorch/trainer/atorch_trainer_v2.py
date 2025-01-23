@@ -1,4 +1,5 @@
 import dataclasses
+import gc
 import json
 import math
 import os
@@ -31,7 +32,6 @@ from transformers.trainer_callback import (
     ProgressCallback,
     TrainerCallback,
     TrainerControl,
-    TrainerState,
 )
 from transformers.trainer_pt_utils import IterableDatasetShard, distributed_concat
 from transformers.trainer_utils import TrainOutput, has_length, speed_metrics
@@ -43,8 +43,8 @@ from atorch.trainer.atorch_profiler import get_profiler
 from atorch.trainer.base.atorch_module import AtorchIRModel
 from atorch.trainer.base.atorch_train_engine import AtorchTrainEngine
 from atorch.trainer.base.dataset import AtorchDataset
-from atorch.trainer.trainer_callback import FlowCallbackV2
-from atorch.trainer.utils import DistributedType
+from atorch.trainer.trainer_callback import AtorchTrainerState, FlowCallbackV2
+from atorch.trainer.utils import DistributedType, print_all_args_before_training
 from atorch.utils.hooks import ATorchHooks
 from atorch.utils.import_util import is_megatron_lm_available, is_torch_npu_available
 from atorch.utils.version import package_version_bigger_than
@@ -55,7 +55,10 @@ if is_megatron_lm_available():
     from atorch.trainer.megatron import AtorchMegatronEngine
 
 if is_torch_npu_available():
-    from torch_npu.profiler import dynamic_profile as dp
+    try:
+        from torch_npu.profiler import dynamic_profile as dp
+    except ImportError:
+        dp = None
 
 
 DEFAULT_FLOW_CALLBACKS = [FlowCallbackV2]
@@ -145,7 +148,7 @@ class AtorchTrainerV2:
         if self.distributed_type != DistributedType.MEGATRON:
             self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
-        self.state = TrainerState(
+        self.state = AtorchTrainerState(
             is_local_process_zero=self.args.is_local_main_process,
             is_world_process_zero=self.args.is_main_process,
         )
@@ -279,39 +282,53 @@ class AtorchTrainerV2:
                 resume_from_checkpoint=resume_from_checkpoint,
                 **kwargs,
             )
+            megatron_args = get_args()
         else:
             raise NotImplementedError(f"Not implemented distributed backend {self.distributed_type}.")
 
         train_dataloader = self.train_engine.get_dataloader("train")
 
-        if args.is_local_main_process:
-            logger.info("------------------------ AtorchTrainingArgs ------------------------")
-            args_dict = args.to_dict()
-            str_list = []
-            for k, v in args_dict.items():
-                dots = "-" * (48 - len(k))
-                str_list.append("  {} {} {}".format(k, dots, v))
-            for arg in sorted(str_list, key=lambda x: x.lower()):
-                logger.info(arg)
-            logger.info("-------------------- end of AtorchTrainingArgs ---------------------")
+        if self.args.finetune_type == "dpo":
+            self.args.custom_dpo_infer_function(self.train_engine.module, self.train_engine._dataloaders)
 
-        # Setting up training control variables:
-        # number of training epochs: num_train_epochs
-        # number of training steps per epoch: num_update_steps_per_epoch
-        # total number of training steps to execute: max_steps
-        # TODO(1009): To compact micro_batch_size in Megatron.
         total_train_batch_size = args.global_train_batch_size * args.gradient_accumulation_steps
 
-        if self.distributed_type == DistributedType.MEGATRON:
-            megatron_args = get_args()
-            if args.max_steps > 0 and args.max_steps != megatron_args.train_iters:
-                logger.warning(
-                    "args.max_steps will be overwritten by megatron_args.train_iters under MEGATRON training mode."
-                )
-            args.max_steps = megatron_args.train_iters
-
         len_dataloader = None
-        if has_length(train_dataloader):
+        if self.distributed_type == DistributedType.MEGATRON:
+            if self.args.finetune_type is not None:
+                len_dataloader = len(train_dataloader)
+                num_update_steps_per_epoch = max(len_dataloader, 1)
+                num_examples = train_dataloader.num_examples
+
+                # Internal checking
+                # args.max_steps has been calculated in MegatronEngine
+                assert args.max_steps > 0, "`max_steps` should be greater than 0"
+                assert (
+                    args.max_steps == megatron_args.train_iters
+                ), "Please ensure trainer args.max_steps is equal to megatron_args.train_iters."
+                max_steps = args.max_steps
+                num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
+                    args.max_steps % num_update_steps_per_epoch > 0
+                )
+                # May be slightly incorrect if the last batch in the training dataloader has a smaller size but it's
+                # the best we can do.
+                num_train_samples = max_steps * total_train_batch_size
+            else:
+                if (
+                    args.max_steps > 0
+                    and megatron_args.train_iters is not None
+                    and args.max_steps != megatron_args.train_iters
+                ):
+                    logger.warning(
+                        "args.max_steps will be overwritten by megatron_args.train_iters under MEGATRON training mode."
+                    )
+                args.max_steps = megatron_args.train_iters
+                max_steps = args.max_steps
+                num_train_epochs = sys.maxsize
+                num_update_steps_per_epoch = max_steps
+                num_examples = total_train_batch_size * max_steps
+                num_train_samples = max_steps * total_train_batch_size
+        elif has_length(train_dataloader):
             len_dataloader = len(train_dataloader)
             num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
             num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
@@ -374,26 +391,35 @@ class AtorchTrainerV2:
         steps_trained_progress_bar = None  # noqa: F841
 
         # Check if continuing training from a checkpoint
-        if resume_from_checkpoint is not None:
+        is_finetune = False
+
+        if self.distributed_type == DistributedType.MEGATRON:
+            is_finetune = get_args().finetune
+
+        # these resuming logic should be somehow moved to engines
+        if resume_from_checkpoint is not None and not is_finetune:
             ais_saved_extra_dict = kwargs.get("ais_saved_extra_dict", None)
 
             if ais_saved_extra_dict:
                 trainer_state_dict = ais_saved_extra_dict.get("trainer_state", None)
                 if trainer_state_dict is None:
                     raise ValueError("not able to load trainer state from ais, please check with ais supporter")
-                self.state = TrainerState(**trainer_state_dict)
+                self.state = AtorchTrainerState(**trainer_state_dict)
                 custom_dict = ais_saved_extra_dict.get("customize_dict", None)
                 if args.distributed_type == "megatron":
                     print(f"custom_dict is {custom_dict}")
                     get_args().customize_dict = custom_dict
             else:
+                trainer_state_path = None
                 if args.distributed_type == "megatron":
-                    trainer_state_path = os.path.join(
-                        resume_from_checkpoint, "iter_{:07d}".format(self.train_engine.iteration)
-                    )
+                    if self.train_engine.iteration > 0:
+                        trainer_state_path = os.path.join(
+                            resume_from_checkpoint, "iter_{:07d}".format(self.train_engine.iteration)
+                        )
                 else:
                     trainer_state_path = resume_from_checkpoint
-                self.state = TrainerState.load_from_json(os.path.join(trainer_state_path, TRAINER_STATE_NAME))
+                if trainer_state_path is not None:
+                    self.state = AtorchTrainerState.load_from_json(os.path.join(trainer_state_path, TRAINER_STATE_NAME))
             epochs_trained = self.state.global_step // num_update_steps_per_epoch
             if not args.ignore_data_skip:
                 steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
@@ -445,27 +471,54 @@ class AtorchTrainerV2:
             timers = get_timers()
             timers("interval-time", log_level=0).start(barrier=True)
 
+        if args.manual_gc:
+            # Disable the default garbage collector and perform the collection manually.
+            # This is to align the timing of garbage collection across ranks.
+            assert (
+                args.manual_gc_interval >= 0
+            ), "Manual garbage collection interval should be greater than or equal to 0."
+            gc.disable()
+            gc.collect()
+
         dist.barrier()
+
+        # Print all args before training.
+        if self.args.is_local_main_process:
+            all_args_to_log = {"AtorchTrainingArgs": self.args.to_dict()}
+            if self.distributed_type == DistributedType.MEGATRON:
+                all_args_to_log["MegatronArgs"] = vars(megatron_args)
+            print_all_args_before_training(all_args_to_log)
+
         with get_profiler(self.args) as prof:
             total_batched_samples = 0
             for epoch in range(epochs_trained, num_train_epochs):
                 epoch_iterator = train_dataloader
-                # TODO: remove the following code, and add set_epoch() method for AtorchDataloader()
-                # if hasattr(epoch_iterator, "set_epoch"):
-                #     epoch_iterator.set_epoch(epoch)
-                # elif hasattr(epoch_iterator.sampler, "set_epoch"):
-                #     epoch_iterator.sampler.set_epoch(epoch)
-
-                # TODO: support past_index
-                # # Reset the past mems state at the beginning of each epoch if necessary.
-                # if args.past_index >= 0:
-                #     self._past = None
+                if self.args.finetune_type is not None:
+                    if hasattr(epoch_iterator, "set_epoch"):
+                        epoch_iterator.set_epoch(epoch)
+                    elif hasattr(epoch_iterator.sampler, "set_epoch"):
+                        epoch_iterator.sampler.set_epoch(epoch)
 
                 steps_in_epoch = (
                     len(epoch_iterator)
                     if len_dataloader is not None
                     else args.max_steps * args.gradient_accumulation_steps
                 )
+
+                if (
+                    self.args.extra_save_frequency_in_epoch is not None
+                    and len(self.args.extra_save_frequency_in_epoch) > 0
+                ):
+                    if isinstance(self.args.extra_save_frequency_in_epoch[0], float):
+                        self.args.extra_save_frequency_in_epoch = [
+                            int(f * steps_in_epoch) for f in self.args.extra_save_frequency_in_epoch
+                        ]
+                    logger.info(
+                        f"In this epoch, checkpoint in step {self.args.extra_save_frequency_in_epoch} will be saved! "
+                        f"There are {steps_in_epoch} steps in this epoch."
+                    )
+                self.state.steps_in_epoch = steps_in_epoch
+
                 self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
                 if (
@@ -491,7 +544,24 @@ class AtorchTrainerV2:
 
                 step = -1
                 for step, inputs in enumerate(epoch_iterator):
+                    # TODO: Move it out
                     self.train_engine.train()
+
+                    if (
+                        self.args.profiler_type == "nsys"
+                        and self.state.global_step == self.args.profile_step_start
+                        and self.args.process_index in self.args.profile_ranks
+                    ):
+                        torch.cuda.cudart().cudaProfilerStart()
+                        torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+
+                    if self.args.flash_checkpoint and self.distributed_type == DistributedType.MEGATRON:
+                        from dlrover.trainer.torch.flash_checkpoint.megatron_async_save.megatron_async_torch_save import (  # noqa: E501
+                            maybe_finalize_async_save,
+                        )
+
+                        maybe_finalize_async_save(False)
+
                     total_batched_samples += 1
                     if rng_to_sync:
                         self._load_rng_state(resume_from_checkpoint)
@@ -517,6 +587,8 @@ class AtorchTrainerV2:
                         # MegatronEngine's train_step() contains:
                         # forward, backward, optimizer.step(), zero_grad()
                         loss = self.train_engine(inputs)
+                        self.state.consumed_train_samples = megatron_args.consumed_train_samples
+                        self.state.total_flos = self.train_engine.num_floating_point_operations_so_far
                     else:
                         with self.train_engine.accumulate():
                             loss = self.train_engine(**inputs)
@@ -526,6 +598,7 @@ class AtorchTrainerV2:
                             self.train_engine.optimizer_step()
                             self.train_engine.scheduler_step()
                             self.train_engine.optimizer_zero_grad()
+                        self.state.consumed_train_samples += self.args.global_train_batch_size
 
                     if args.logging_nan_inf_filter and (torch.isnan(loss) or torch.isinf(loss)):
                         # if loss is nan or inf simply add the average of previous logged losses
@@ -544,19 +617,40 @@ class AtorchTrainerV2:
                     ):
                         self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        self.state.current_step_in_epoch = step + 1 + steps_skipped
                         self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
                         self._maybe_log_save_evaluate(tr_loss, self.model, epoch)
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
-                    if self.control.should_epoch_stop or self.control.should_training_stop:
-                        break
-
-                    if self.args.profiler_type == "hw_dp":
-                        dp.step()
+                    if (
+                        self.args.profiler_type == "nsys"
+                        and self.state.global_step == self.args.profile_step_end
+                        and self.args.process_index in self.args.profile_ranks
+                    ):
+                        torch.cuda.cudart().cudaProfilerStop()
+                    elif self.args.profiler_type == "hw_dp":
+                        if dp is not None:
+                            dp.step()
                     elif prof is not None and not isinstance(prof, nullcontext):
                         prof.step()
+
+                    if (
+                        self.args.empty_cache_steps is not None
+                        and self.state.global_step % self.args.empty_cache_steps == 0
+                    ):
+                        torch.cuda.empty_cache()
+
+                    if self.args.manual_gc:
+                        if (
+                            self.args.manual_gc_interval != 0
+                            and self.state.global_step % self.args.manual_gc_interval == 0
+                        ):
+                            gc.collect()
+
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        break
 
                 if step < 0:
                     logger.warning(
@@ -580,6 +674,13 @@ class AtorchTrainerV2:
         # self.store_flos()
         # metrics["total_flos"] = self.state.total_flos
         metrics["train_loss"] = train_loss
+
+        if self.args.flash_checkpoint and self.distributed_type == DistributedType.MEGATRON:
+            from dlrover.trainer.torch.flash_checkpoint.megatron_async_save.megatron_async_torch_save import (
+                maybe_finalize_async_save,
+            )
+
+            maybe_finalize_async_save(True)
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
@@ -612,9 +713,17 @@ class AtorchTrainerV2:
 
         metrics = None
         if self.control.should_evaluate:
+            if self.args.manual_gc and self.args.manual_gc_eval:
+                # Collect all objects.
+                gc.collect()
             if self.distributed_type == DistributedType.MEGATRON:
+                megatron_args = get_args()
                 timers("interval-time").stop()
+                if megatron_args.use_distributed_optimizer and megatron_args.overlap_param_gather:
+                    self.train_engine.optimizer.disable_pre_hook()
                 metrics = self.evaluate()
+                if megatron_args.use_distributed_optimizer and megatron_args.overlap_param_gather:
+                    self.train_engine.optimizer.enable_pre_hook()
                 timers("interval-time", log_level=0).start(barrier=True)
             else:
                 # TODO: Implement evaluate
@@ -626,6 +735,9 @@ class AtorchTrainerV2:
                     if not metric_to_check.startswith("eval_"):
                         metric_to_check = f"eval_{metric_to_check}"
                     self.lr_scheduler.step(metrics[metric_to_check])
+            if self.args.manual_gc and self.args.manual_gc_eval:
+                # Collect only the objects created and used in evaluation.
+                gc.collect(generation=0)
 
         if self.control.should_save:
             # Save model checkpoint
@@ -761,7 +873,10 @@ class AtorchTrainerV2:
         batch_size = self.args.global_eval_batch_size
 
         logger.info("***** Running Evaluation *****")
-        if has_length(eval_dataloader):
+        if self.distributed_type == DistributedType.MEGATRON:
+            num_examples = max_eval_steps * megatron_args.global_batch_size
+            logger.info(f"  Num examples = {num_examples}")
+        elif has_length(eval_dataloader):
             logger.info(f"  Num examples = {self.num_examples(eval_dataloader)}")
         else:
             logger.info("  Num examples: Unknown")

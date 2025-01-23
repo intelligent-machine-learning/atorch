@@ -2,12 +2,21 @@ import os
 import pickle
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
-import amp_C
 import torch
 import torch.distributed
-from apex.multi_tensor_apply import multi_tensor_applier
+from transformers.utils import ExplicitEnum
+
+try:
+    import amp_C
+except ImportError:
+    amp_C = None
+
+try:
+    from apex.multi_tensor_apply import multi_tensor_applier
+except ImportError:
+    multi_tensor_applier = None
 
 import atorch
 from atorch.common.log_utils import default_logger as logger
@@ -25,12 +34,16 @@ if is_megatron_lm_available():
     from megatron.core.transformer.moe.moe_utils import track_moe_metrics
     from megatron.training.global_vars import (
         get_args,
-        get_num_microbatches,
         get_one_logger,
         get_tensorboard_writer,
         get_timers,
         get_wandb_writer,
     )
+
+    try:
+        from megatron.training.global_vars import get_num_microbatches
+    except ImportError:
+        from megatron.core.num_microbatches_calculator import get_num_microbatches
     from megatron.training.theoretical_memory_usage import report_theoretical_memory
     from megatron.training.training import num_floating_point_operations
     from megatron.training.utils import print_rank_last, report_memory
@@ -51,7 +64,8 @@ class DistributedType(str, Enum):
 
 
 def is_main_process():
-    return atorch.rank() == 0
+    world_rank = atorch.rank()
+    return world_rank is None or world_rank == 0
 
 
 def is_local_main_process():
@@ -116,16 +130,17 @@ def gather_param_in_tensor_model_group(name, param):
 
 
 def distributed_std(name, param):
-    if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
-        # TODO(@jinshi.cl): consider whether allgather params is necessary.
-        param = gather_param_in_tensor_model_group(name, param)
     count = torch.tensor(torch.numel(param), dtype=torch.int32, device=param.device)
     sums = torch.sum(param)
-    torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group())
-    torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group())
+    if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
+        torch.distributed.all_reduce(count, group=mpu.get_tensor_model_parallel_group())
+        torch.distributed.all_reduce(sums, group=mpu.get_tensor_model_parallel_group())
+
+    torch.distributed.all_reduce(sums, group=mpu.get_data_parallel_group())
+    torch.distributed.all_reduce(count, group=mpu.get_data_parallel_group())
     mean = sums / count
     square_sums = torch.sum(torch.square(param - mean))
-    torch.distributed.all_reduce(square_sums, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group())
+    torch.distributed.all_reduce(square_sums, group=mpu.get_data_parallel_group())
 
     return (square_sums.float() / (count - 1)) ** 0.5  # unbiased estimator
 
@@ -274,6 +289,7 @@ def training_log(
     custom_metrics,
 ):
     """Log training information such as losses, timing, ...."""
+
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -352,18 +368,37 @@ def training_log(
     # Tensorboard values.
     # Timer requires all the ranks to call.
     if args.log_timers_to_tensorboard and (iteration % args.tensorboard_log_interval == 0):
-        timers.write(timers_to_log, writer, iteration, normalizer=total_iterations)
+        if hasattr(args, "use_local_sgd") and args.use_local_sgd:
+            # Lazy import patches for local sgd logging
+            from atorch.local_sgd.megatron.parallel_state import get_non_data_parallel_group
+
+            timers.write(
+                timers_to_log,
+                writer,
+                iteration,
+                normalizer=total_iterations,
+                process_group=get_non_data_parallel_group(),
+            )
+        else:
+            timers.write(timers_to_log, writer, iteration, normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({"samples vs steps": args.consumed_train_samples}, iteration)
-        if args.log_learning_rate_to_tensorboard:
+
+        should_log_learning_rate_to_tensorboard = (
+            args.log_learning_rate_to_tensorboard if hasattr(args, "log_learning_rate_to_tensorboard") else True
+        )
+        if should_log_learning_rate_to_tensorboard:
             writer.add_scalar("learning-rate", learning_rate, iteration)
             if args.decoupled_lr is not None:
                 writer.add_scalar("decoupled-learning-rate", decoupled_learning_rate, iteration)
             writer.add_scalar("learning-rate vs samples", learning_rate, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({"learning-rate": learning_rate}, iteration)
-        if args.log_batch_size_to_tensorboard:
+        should_log_batch_size_to_tensorboard = (
+            args.log_batch_size_to_tensorboard if hasattr(args, "log_batch_size_to_tensorboard") else True
+        )
+        if should_log_batch_size_to_tensorboard:
             writer.add_scalar("batch-size", batch_size, iteration)
             writer.add_scalar("batch-size vs samples", batch_size, args.consumed_train_samples)
             if wandb_writer:
@@ -431,7 +466,9 @@ def training_log(
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
 
     if iteration % args.log_interval == 0:
-        elapsed_time = timers("interval-time").elapsed(barrier=True)
+        elapsed_time = timers("interval-time").elapsed(
+            barrier=not (hasattr(args, "use_local_sgd") and args.use_local_sgd)
+        )
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
         throughput = num_floating_point_operations(args, batch_size) / (
@@ -511,7 +548,13 @@ def training_log(
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory("(after {} iterations)".format(iteration))
             report_memory_flag = False
-        timers.log(timers_to_log, normalizer=args.log_interval)
+        if hasattr(args, "use_local_sgd") and args.use_local_sgd:
+            # Lazy import patches for local sgd logging
+            from atorch.local_sgd.megatron.parallel_state import get_non_data_parallel_group
+
+            timers.log(timers_to_log, normalizer=args.log_interval, process_group=get_non_data_parallel_group())
+        else:
+            timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag, all_logging_metrics
 
@@ -562,6 +605,12 @@ def get_grad_norm_fp32(
     else:
         if norm_type == 2.0:
             dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device="cuda")
+
+            # Check the availability of apex
+            assert (
+                multi_tensor_applier is not None and amp_C is not None
+            ), "apex is not available, please install it from https://github.com/NVIDIA/apex"
+
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
@@ -590,7 +639,7 @@ def get_grad_norm_fp32(
     return total_norm
 
 
-def get_main_grads_in_params(model_chunks: List[MegatronModule]):
+def get_main_grads_in_params(model_chunks: List["MegatronModule"]):
     """
     Get main_grads that should be taken into account to scale the grad.
     Filter parameters based on:
@@ -615,7 +664,7 @@ def get_main_grads_in_params(model_chunks: List[MegatronModule]):
 
 
 def scale_main_grad_for_spike_loss(
-    model_chunks: List[MegatronModule], spike_loss_ratio: float, log_grad_diff_for_debug: bool = False
+    model_chunks: List["MegatronModule"], spike_loss_ratio: float, log_grad_diff_for_debug: bool = False
 ):
     """
     Scale main_grad of model params.
@@ -639,7 +688,7 @@ def scale_main_grad_for_spike_loss(
         )
 
 
-def get_grads_in_optimizer(optimizer: MegatronOptimizer):
+def get_grads_in_optimizer(optimizer: "MegatronOptimizer"):
     if isinstance(optimizer, (DistributedOptimizer, Float16OptimizerWithFloat16Params)):
         optimizer._copy_model_grads_to_main_grads()
         return optimizer.get_main_grads_for_grad_norm()
@@ -653,7 +702,7 @@ def get_grads_in_optimizer(optimizer: MegatronOptimizer):
 
 
 def scale_grad_for_spike_loss(
-    optimizer: MegatronOptimizer, spike_loss_ratio: float, log_grad_diff_for_debug: bool = False
+    optimizer: "MegatronOptimizer", spike_loss_ratio: float, log_grad_diff_for_debug: bool = False
 ):
     """
     Scale grad of optimizer.
@@ -675,3 +724,23 @@ def scale_grad_for_spike_loss(
             f"[Rank {torch.distributed.get_rank()}] after scaling grad with ratio {spike_loss_ratio}, "
             f"grad norm {original_grad_norm} -> {scaled_grad_norm}"
         )
+
+
+def print_all_args_before_training(all_args: Dict[str, Dict]):
+    logger.info("\n=============== Print all args before training ===============")
+    for title, args in all_args.items():
+        logger.info(f"************************ {title} ************************")
+        str_list = []
+        for k, v in args.items():
+            dots = "*" * (48 - len(k))
+            str_list.append("  {} {} {}".format(k, dots, v))
+        for arg in sorted(str_list, key=lambda x: x.lower()):
+            logger.info(arg)
+        logger.info(f"******************** end of {title} *********************\n")
+
+
+class IntervalStrategy(ExplicitEnum):
+    NO = "no"
+    STEPS = "steps"
+    EPOCH = "epoch"
+    SAMPLES = "samples"

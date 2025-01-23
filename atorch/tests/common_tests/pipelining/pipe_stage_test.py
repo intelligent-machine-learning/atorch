@@ -1,6 +1,7 @@
 import os
 import unittest
 
+import pytest
 import torch
 import torch.multiprocessing as mp
 from model_registry import MultiMLP, create_pipe_group
@@ -21,6 +22,9 @@ else:
         None,
     )
     skip = True
+
+
+pytestmark = pytest.mark.core24
 
 
 d_hid = 512

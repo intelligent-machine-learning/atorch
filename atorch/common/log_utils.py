@@ -120,3 +120,12 @@ class Timer:
             if os.environ.get("ATORCH_DEBUG"):
                 rank = atorch.local_rank()
                 default_logger.info("{} on rank {} cost: {} s".format(self.name, rank, self.elapsed_time))
+
+
+def log_rank_0(message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            default_logger.info(message)
+    else:
+        default_logger.info(message)

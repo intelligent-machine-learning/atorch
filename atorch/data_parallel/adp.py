@@ -5,13 +5,23 @@ from collections import OrderedDict  # noqa: F401
 from typing import Any, List
 
 import torch
-from fairscale.nn.data_parallel.fully_sharded_data_parallel import (
-    FullyShardedDataParallel,
-    TrainingState,
-    cast_floats_to_right_precision,
-    free_storage_,
-)
-from fairscale.utils.containers import apply_to_tensors
+
+try:
+    from fairscale.nn.data_parallel.fully_sharded_data_parallel import (
+        FullyShardedDataParallel,
+        TrainingState,
+        cast_floats_to_right_precision,
+        free_storage_,
+    )
+    from fairscale.utils.containers import apply_to_tensors
+except (ImportError, ModuleNotFoundError):
+    FullyShardedDataParallel = object
+    TrainingState = None
+    cast_floats_to_right_precision = None
+    free_storage_ = None
+    apply_to_tensors = None
+
+
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
@@ -33,6 +43,8 @@ class AllDataParallel(FullyShardedDataParallel):
                       self.optimizer.step() will be called when grad `reduce_scatter` finish.
             process_group (torch distributed group): control adp world size such ad MoeLayer
         """
+        if TrainingState is None:
+            raise RuntimeError("adp are suppored with fairscale installed.")
         self.inject_optimizer = inject_optimizer
         self.optimizer = None
 
