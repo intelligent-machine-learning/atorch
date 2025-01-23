@@ -43,6 +43,7 @@ ATorch is an extension library of PyTorch developed by Ant Group's AI Infrastruc
   * Transformer ops
   * High-performance MOE
   * sub-graph compilation
+  * [Local SGD/EDiT](docs/README-EDiT.md)
 * Checkpointing
 * Mixed precision
 * Communication optimization
@@ -109,7 +110,7 @@ python -m atorch.distributed.run  --nproc_per_node 2  train.py --model_type llam
 
 [WSAM optimizer](docs/README-WSAM.md)
 
-
+[Local SGD/EDiT](docs/README-EDiT.md)
 
 
 ## Contributing
