@@ -58,6 +58,8 @@ class MIPTensorParallelPlanner(BaseTensorParallelPlanner):
         self.grad_factor = 1.0
         self.param_factor = 1.0
         self.optimizer_factor = 1.0
+        if pyo == object:
+            print("Install pyomo==6.7.0 to support mip_tp_planner.")
 
     def set_mem_factors(self, forward_factor, grad_factor, param_factor, optimizer_factor):
         self.forward_factor = forward_factor

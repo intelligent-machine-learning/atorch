@@ -139,3 +139,14 @@ def patch_te_if_needed():
 
         CheckpointFunction.forward = te_checkpoint_forward
         CheckpointFunction.backward = te_checkpoint_backward
+
+    # patch has_te_modules/_is_te_module to support Precision_switchableLinear with activation checkpointing
+    import transformer_engine
+
+    def my_has_te_modules(network):
+        return True
+
+    if hasattr(transformer_engine.pytorch.distributed, "has_te_modules"):
+        transformer_engine.pytorch.distributed.has_te_modules = my_has_te_modules
+    if hasattr(transformer_engine.pytorch.distributed, "_is_te_module"):
+        transformer_engine.pytorch.distributed._is_te_module = my_has_te_modules

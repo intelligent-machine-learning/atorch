@@ -5,11 +5,23 @@ from copy import copy
 from functools import partial
 
 import torch
-from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
-from fairscale.optim.oss import OSS
+
+try:
+    from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
+    from fairscale.optim.oss import OSS
+
+    import atorch.utils.patch_fairscale  # noqa: F401
+except (ImportError, ModuleNotFoundError):
+    ShardedDDP = None
+    OSS = None
+
+
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-import atorch.utils.patch_fairscale  # noqa: F401
+try:
+    from torch.distributed.fsdp import MixedPrecision
+except ImportError:
+    MixedPrecision = None
 
 try:
     from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy as auto_wrap_policy
@@ -21,11 +33,31 @@ from typing import Set, Type
 from atorch.auto.auto_accelerate_context import AutoAccelerateContext
 from atorch.auto.opt_lib.optimization import Optimization
 from atorch.auto.opt_lib.utils import find_modules, to_module_class_by_name
+from atorch.common.env import EnvSetting
 from atorch.common.log_utils import default_logger as logger
-from atorch.distributed.distributed import local_rank, parallel_group, parallel_group_size
+from atorch.distributed.distributed import get_device_mesh, local_rank, parallel_group, parallel_group_size
 from atorch.modules.distributed_modules.materialize_modules import materialize_modules_to_device
 from atorch.utils.meta_model_utils import is_meta
+from atorch.utils.patch_fsdp_param import (
+    FSDP2PatchContext,
+    patch_fsdp2_backward_prefetch,
+    patch_fsdp2_get_managed_states,
+    patch_fsdp2_post_forward,
+    patch_fsdp2_pre_backward,
+)
 from atorch.utils.version import get_version, torch_version
+
+if torch_version() >= FSDP2PatchContext().FSDP2_PATCH_TORCH_VERSION:  # type: ignore
+    from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+
+    patch_fsdp2_get_managed_states()
+    patch_fsdp2_pre_backward()
+    patch_fsdp2_backward_prefetch()
+    patch_fsdp2_post_forward()
+else:
+    fully_shard = None
+    MixedPrecisionPolicy = object
 
 
 def _skip_match_module_child_wrap_policy_pre_2(
@@ -137,6 +169,7 @@ class Zero1Optimization(Optimization):
 
         config = copy(config) or {}
         use_ds_zero = config.pop("use_ds_zero", False)
+
         if use_ds_zero:
             config["zero2"] = False
             model_context.add_wrapper(
@@ -146,6 +179,10 @@ class Zero1Optimization(Optimization):
                 is_pre_wrapper=False,
             )
         else:
+            if OSS is None:
+                logger.error("Zero1 ignored as fairscale is not installed!")
+                return model_context
+
             new_optim_args = {}
             new_optim_args["optim"] = model_context.optim_func
             new_optim_args["group"] = parallel_group("data")
@@ -177,6 +214,7 @@ class Zero2Optimization(Optimization):
         # skip zero2 optimization when user did not pass optim_func
         if model_context.optim_func is None:
             return model_context
+
         config = copy(config) or {}
         use_ds_zero = config.pop("use_ds_zero", False)
         not_use_fsdp = config.pop("not_use_fsdp", False)
@@ -190,6 +228,8 @@ class Zero2Optimization(Optimization):
             )
         elif not_use_fsdp or torch_version() < (1, 12, 0) or not torch.cuda.is_available():
             # use fairscale zero2 with OSS
+            if ShardedDDP is None:
+                raise RuntimeError("Zero2 with not_use_fsdp=True not supported as fairscale is not installed!")
             new_optim_args = {}
             new_optim_args["optim"] = model_context.optim_func
             new_optim_args["group"] = parallel_group("zero") or parallel_group("data")
@@ -240,8 +280,8 @@ class Zero2Optimization(Optimization):
 
 
 class FSDPOptimization(Optimization):
-    def __init__(self):
-        super().__init__(name="fsdp", group="zero", is_tunable=False, is_distributed=True)
+    def __init__(self, name="fsdp"):
+        super().__init__(name=name, group="zero", is_tunable=False, is_distributed=True)
 
     def distributed_only(self, config=None):
         # cpu offload can be used in non-distributed mode
@@ -277,6 +317,14 @@ class FSDPOptimization(Optimization):
         return model_context
 
     @staticmethod
+    def find_ignored_modules_and_del_item_in_config(wrapper_config, model_context):
+        ignored_cls = wrapper_config["atorch_ignored_cls"]
+        del wrapper_config["atorch_ignored_cls"]
+        ignored_cls = to_module_class_by_name(model_context.model, ignored_cls)
+        ignore_modules = find_modules(model_context.model, ignored_cls)
+        return set(ignore_modules)
+
+    @staticmethod
     def apply_wrapper(model_context, wrapper_name, wrapper_config=None):
         """FSDP must be created before optimizer is created, it's a pre wrapper"""
 
@@ -288,6 +336,18 @@ class FSDPOptimization(Optimization):
 
         torch.cuda.set_device(local_rank())
         wrapper_config = wrapper_config or {}
+        if "mixed_precision" in wrapper_config and isinstance(wrapper_config["mixed_precision"], dict):
+            mixp_configs = wrapper_config["mixed_precision"]
+            wrapper_config["mixed_precision"] = (
+                MixedPrecision(
+                    param_dtype=mixp_configs["param_dtype"],
+                    reduce_dtype=mixp_configs["reduce_dtype"],
+                    buffer_dtype=mixp_configs["buffer_dtype"],
+                )
+                if MixedPrecision
+                else True
+            )
+
         # atorch_wrap_cls or atorch_size_based_min_num_params
         if "atorch_wrap_cls" in wrapper_config and torch_version() >= (1, 12, 1):
             wrap_cls = wrapper_config["atorch_wrap_cls"]
@@ -320,10 +380,9 @@ class FSDPOptimization(Optimization):
         if torch_version() >= (1, 12, 0):
             # ignore embedding
             if "atorch_ignored_cls" in wrapper_config:
-                ignored_cls = wrapper_config["atorch_ignored_cls"]
-                del wrapper_config["atorch_ignored_cls"]
-                ignored_cls = to_module_class_by_name(model_context.model, ignored_cls)
-                ignore_modules = find_modules(model_context.model, ignored_cls)
+                ignore_modules = FSDPOptimization.find_ignored_modules_and_del_item_in_config(
+                    wrapper_config, model_context
+                )
                 if ignore_modules:
                     wrapper_config["ignored_modules"] = set(ignore_modules)
             # default to use "backward_prefetch"
@@ -424,15 +483,9 @@ class FSDPOptimization(Optimization):
             elif fsdp_clz is not FSDP:
                 raise RuntimeError("use_local_sgd only supports basic FSDP class.")
             else:
-                from atorch.local_sgd.HSDP import patch_local_sgd_to_fsdp
+                from atorch.local_sgd import patch_local_sgd_to_fsdp
 
                 patch_local_sgd_to_fsdp()
-
-        anomaly_configs = wrapper_config.get("anomaly_configs", None)
-        if anomaly_configs:
-            from atorch.local_sgd.HSDP import patch_local_sgd_to_fsdp
-
-            patch_local_sgd_to_fsdp()
 
         model_context.model = fsdp_clz(
             model_context.model,
@@ -554,3 +607,131 @@ def apply_ds_zero_wrapper(model_context, wrapper_name, wrapper_config):
     )
 
     return model_context
+
+
+class FSDP2Optimization(FSDPOptimization):
+    def __init__(self):
+        super().__init__(name="fsdp2")
+
+    def transform(self, model_context, config=None):
+        """Transform use FSDP2
+        Args:
+            model_context: ModelContext instance
+            config(dict): FSDP2 parameters and optional atorch specific configs below.
+                          atorch_wrap_cls:
+                              tuple/list of module classes to wrap with fsdp2.
+                          auto_wrap_policy:
+                              torch CustomPolicy or ModuleWrapPolicy instance.
+        Returns:
+            transformed ModelContext instance
+        """
+        if not torch.cuda.is_available():
+            raise ValueError("FSDP2 only support GPU !")
+        model_context.add_wrapper(
+            "fsdp2", FSDP2Optimization.apply_wrapper, wrapper_config=copy(config), is_pre_wrapper=True
+        )
+
+        return model_context
+
+    @staticmethod
+    def apply_wrapper(model_context, wrapper_name, wrapper_config=None):
+        """FSDP2 must be created before optimizer is created, it's a pre wrapper"""
+        assert torch_version() >= (2, 5, 0)
+
+        torch.cuda.set_device(local_rank())
+        wrapper_config = wrapper_config or {}
+
+        def wrap_cls_policy_fn_device_mesh(module, wrap_cls):
+            data_device_mesh = get_device_mesh("data")
+            cls_to_fsdp_device_mesh = {per_wrap_cls: data_device_mesh for per_wrap_cls in wrap_cls}
+
+            if module.__class__ in cls_to_fsdp_device_mesh:
+                dm = cls_to_fsdp_device_mesh[module.__class__]
+                return {"device_mesh": dm}
+            return False
+
+        wrap_policy_func = None
+        if "atorch_wrap_cls" in wrapper_config:
+            wrap_cls = wrapper_config["atorch_wrap_cls"]
+            del wrapper_config["atorch_wrap_cls"]
+            # atorch_wrap_cls may contain string for module name, convert to module class.
+            wrap_cls = to_module_class_by_name(model_context.model, wrap_cls)
+            wrap_cls = set(wrap_cls)
+
+            wrap_policy_func = functools.partial(wrap_cls_policy_fn_device_mesh, wrap_cls=wrap_cls)
+        elif "auto_wrap_policy" in wrapper_config:
+            from torch.distributed.fsdp.wrap import CustomPolicy
+
+            if isinstance(wrapper_config["auto_wrap_policy"], CustomPolicy):
+                wrap_policy_func = wrapper_config["auto_wrap_policy"]._lambda_fn
+            elif isinstance(wrapper_config["auto_wrap_policy"], ModuleWrapPolicy):
+                wrap_cls = wrapper_config["auto_wrap_policy"]._module_classes
+                wrap_policy_func = functools.partial(wrap_cls_policy_fn_device_mesh, wrap_cls=wrap_cls)
+            else:
+                raise NotImplementedError()
+
+        mp_policy = None
+        if "mixed_precision" in wrapper_config and isinstance(wrapper_config["mixed_precision"], dict):
+            mixp_configs = wrapper_config["mixed_precision"]
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=mixp_configs["param_dtype"], reduce_dtype=mixp_configs["reduce_dtype"]
+            )
+
+        tp_enabled = parallel_group("tensor") is not None
+        pp_enabled = parallel_group("pipe") is not None
+
+        FSDP2Optimization.apply_fsdp(model_context.model, wrap_policy_func, mp_policy, tp_enabled, pp_enabled)
+
+        if "param_init_fn" in wrapper_config:
+            FSDP2Optimization.init_param(model_context.model, wrapper_config["param_init_fn"])
+        return model_context
+
+    @staticmethod
+    def init_param(model, param_init_fn):
+        model.to_empty(device=torch.device("cuda"))
+        for _, named_module in model.named_modules():
+            param_init_fn(named_module)
+
+    @staticmethod
+    def apply_fsdp(model, wrap_policy_func, mp_policy, tp_enabled, pp_enabled):
+        if tp_enabled:
+            # fsdp2 + tp supported with torch version >= 2.5.0.
+            assert torch_version() >= (2, 5, 0)
+
+        if wrap_policy_func is not None:
+            named_modules = [named_module for _, named_module in model.named_modules()]
+            named_modules.reverse()
+            for named_module in named_modules:
+                if named_module == model:
+                    continue
+
+                policy_res = wrap_policy_func(named_module)
+                if not policy_res:
+                    continue
+
+                if pp_enabled:
+                    # For PP, do not reshard after forward to avoid per-microbatch
+                    # all-gathers, which can be expensive and non-overlapped
+                    reshard_after_forward = False
+                else:
+                    # TODO: add option to control reshard_after_forward for different modules.
+                    reshard_after_forward = True
+
+                if isinstance(policy_res, dict):
+                    dp_mesh = policy_res["device_mesh"]
+                else:
+                    assert NotImplementedError()
+
+                fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
+                fully_shard(
+                    named_module,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward or EnvSetting().FORCE_FSDP2_RESHARD_AFTER_FORWARD,
+                )
+
+        dp_mesh = get_device_mesh("data")
+        fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
+        fully_shard(
+            model, **fsdp_config, reshard_after_forward=not pp_enabled or EnvSetting().FORCE_FSDP2_RESHARD_AFTER_FORWARD
+        )
+        logger.info("Applied FSDP2 to the model")

@@ -15,15 +15,28 @@ from pathlib import Path
 from typing import Dict, Union
 
 import torch
+from torch import nn
+
+try:
+    from torch.distributed._tensor.api import distribute_tensor
+except (ImportError, ModuleNotFoundError):
+    distribute_tensor = None
 
 from atorch import local_rank, rank
+from atorch.common.constants import FSDPConstants
+from atorch.common.env import EnvSetting
 from atorch.common.log_utils import default_logger as logger
 from atorch.common.util_func import recursive_setattr
 from atorch.utils.fsdp_save_util import ShardTensorUtil
 from atorch.utils.fsdp_save_util import version_check as fsdp_save_util_version_check
 from atorch.utils.graph_transform_utils import map_aggregate
+from atorch.utils.patch_fsdp_param import FSDP2PatchContext, patch_fsdp2_init_sharded_param
+from atorch.utils.version import torch_version
 
 _super_init_call = torch.nn.Module.__init__
+
+if torch_version() >= FSDP2PatchContext().FSDP2_PATCH_TORCH_VERSION:  # type: ignore
+    patch_fsdp2_init_sharded_param()
 
 
 """
@@ -238,6 +251,9 @@ def init_empty_weights_with_disk_offload(
         # the first mod is the root module
         _mods_to_clean.append(mod)
 
+        if not hasattr(mod, FSDPConstants.ATORCH_CHECKPOINTED_BY_DISK_OFFLOAD):
+            setattr(mod, FSDPConstants.ATORCH_CHECKPOINTED_BY_DISK_OFFLOAD, True)
+
         return _hack_reset_param(mod, init_fn, args, kwargs)
 
     try:
@@ -348,7 +364,7 @@ def _retie_weights(model, _tied_parameters):
         setattr(dst_module, dst_name, src_weight)
 
 
-def _reload_meta_parameter(module, tensor_name, device, value=None, ckpt_name=None):
+def _select_cur_module_and_name(module, tensor_name, index=-1):
     if "." in tensor_name:
         splits = tensor_name.split(".")
         for split in splits[:-1]:
@@ -356,10 +372,17 @@ def _reload_meta_parameter(module, tensor_name, device, value=None, ckpt_name=No
             if new_module is None:
                 raise ValueError(f"{module} has no attribute {split}.")
             module = new_module
-        tensor_name = splits[-1]
+        tensor_name = splits[index]
 
     if tensor_name not in module._parameters and tensor_name not in module._buffers:
         raise ValueError(f"{module} does not have a parameter or a buffer named {tensor_name}.")
+
+    return tensor_name, module
+
+
+def _reload_meta_parameter(module, tensor_name, device, value=None, ckpt_name=None):
+    tensor_name, module = _select_cur_module_and_name(module, tensor_name)
+
     is_buffer = tensor_name in module._buffers
     old_value = getattr(module, tensor_name)
 
@@ -477,7 +500,183 @@ def recursive_empty_param(mod, prefix_name="", ignore_save=False):
         empty_param(m, prefix_name=prefix_name, ignore_save=ignore_save)
 
 
-def reload_meta_module(module, device="cpu", delete_ckpt_name=True, retie_weights=True):
+def _loop_and_reload(module, delete_ckpt_name, device):
+    for name, param in module.named_parameters():
+        if param.device == torch.device("meta"):
+            if hasattr(param, "checkpoint_name"):
+                if Path(param.checkpoint_name).exists():
+                    loaded_param = torch.load(param.checkpoint_name)
+                elif _MetaModeContext._SHARD_FLAT_PARAM_LOADER:
+                    if hasattr(param, "sync_module_states"):
+                        loaded_param = _MetaModeContext.get_current_shard_flat_loader().load_tensor_by_name(
+                            param.checkpoint_name, sync_module_states=True
+                        )
+                        delattr(param, "sync_module_states")
+                    elif hasattr(param, "intra_load"):
+                        loaded_param = _MetaModeContext.get_current_shard_flat_loader().load_with_intra_nodes(
+                            param.checkpoint_name
+                        )
+                        delattr(param, "intra_load")
+                    else:
+                        loaded_param = _MetaModeContext.get_current_shard_flat_loader().load_tensor_by_name(
+                            param.checkpoint_name
+                        )
+                else:
+                    raise ValueError(
+                        (
+                            "reload meta module needs set `checkpoint_name`, for init, "
+                            "you needs set checkpoint_name for a file which is saved by torch. "
+                            "For load ckpt, you need to set `checkpoint_name` and use "
+                            "ShardTensorUtil to load flat param."
+                        )
+                    )
+                if loaded_param.dtype is not param.dtype:
+                    loaded_param = loaded_param.to(param.dtype)
+                # ckpt_name: set to the new Parameter, None if delete ckpt name
+                # old_ckpt_name: set to the old Parameter, in case weight tying
+                ckpt_name = param.checkpoint_name if not delete_ckpt_name else None
+                old_ckpt_name = param.checkpoint_name
+                # checkpoint_name attr must be deleted as this is a custom attr and is cannot be used
+                # to initialize the new Parameter object
+                delattr(param, "checkpoint_name")
+                _reload_meta_parameter(module, name, device, value=loaded_param, ckpt_name=ckpt_name)
+                # In case param is shared by other submodules, old_ckpt_name has to be written back
+                # so the other submodules can correctly load the param
+                setattr(param, "checkpoint_name", old_ckpt_name)
+                del loaded_param, param
+            else:
+                raise ValueError(f"meta model {module} is not checkpointed, for {name}")
+        elif param.device != torch.device(device):
+            logger.info("reload meta param %s", name)
+            _reload_meta_parameter(module, name, device)
+    for name, buffer in module.named_buffers():
+        if buffer.device == torch.device("meta"):
+            if hasattr(buffer, "checkpoint_name"):
+                if Path(buffer.checkpoint_name).exists():
+                    loaded_buffer = torch.load(buffer.checkpoint_name)
+                elif _MetaModeContext._SHARD_FLAT_PARAM_LOADER:
+                    loaded_buffer = _MetaModeContext.get_current_shard_flat_loader().load_tensor_by_name(
+                        buffer.checkpoint_name
+                    )
+                else:
+                    raise ValueError(
+                        (
+                            "reload meta module needs set `checkpoint_name`, for init, "
+                            "you needs set checkpoint_name for a file which is saved by torch. "
+                            "For load ckpt, you need to set `checkpoint_name` and use "
+                            "ShardTensorUtil to load flat param."
+                        )
+                    )
+                if loaded_buffer.dtype is not buffer.dtype:
+                    loaded_buffer = loaded_buffer.to(buffer.dtype)
+                ckpt_name = buffer.checkpoint_name if not delete_ckpt_name else None
+                old_ckpt_name = buffer.checkpoint_name
+                delattr(buffer, "checkpoint_name")
+                _reload_meta_parameter(module, name, device, value=loaded_buffer, ckpt_name=ckpt_name)
+                setattr(buffer, "checkpoint_name", ckpt_name)
+                del loaded_buffer, buffer
+            else:
+                raise ValueError(f"meta model is not checkpointed, for {name}")
+        elif buffer.device != torch.device(device):
+            logger.info("reload meta buffer %s", name)
+            _reload_meta_parameter(module, name, device)
+
+    for child in module.children():
+        _loop_and_reload(child, delete_ckpt_name, device)
+
+
+def _reload_meta_parameter_fsdp2(module, tensor_name, device, value, ckpt_name=None, is_buffer=False):
+    with torch.no_grad():
+        if isinstance(value, torch.Tensor):
+            new_value = value.to(device)
+        else:
+            new_value = torch.tensor(value, device=device)
+
+        if is_buffer:
+            tensor_name, module = _select_cur_module_and_name(module, tensor_name)
+            assert tensor_name in module._buffers
+
+            if ckpt_name is not None:
+                setattr(new_value, FSDPConstants.CHECKPOINT_NAME, ckpt_name)
+
+            module._buffers[tensor_name] = new_value
+            if EnvSetting().DEBUG and torch.distributed.get_rank() == 0:
+                print("set buffer", tensor_name, type(new_value))
+        else:
+            tensor_names = tensor_name.split(".")
+            cur = module
+            parent = None
+            for name in tensor_names:
+                parent = cur
+                cur = getattr(cur, name)
+
+            if torch.device(device) != cur.device:
+                if EnvSetting().DEBUG:
+                    assert cur.full_tensor().size() == new_value.size()
+                new_dtensor = distribute_tensor(new_value, device_mesh=cur.device_mesh, placements=cur.placements)
+                new_dtensor = nn.Parameter(new_dtensor, requires_grad=cur.requires_grad)
+                kwargs = cur.__dict__
+                if EnvSetting().DEBUG:
+                    assert new_dtensor.full_tensor().size() == new_value.size()
+
+                if ckpt_name is not None:
+                    setattr(new_dtensor, FSDPConstants.CHECKPOINT_NAME, ckpt_name)
+                for key in kwargs:
+                    setattr(new_dtensor, key, kwargs[key])
+
+                tensor_name = tensor_names[-1]
+                setattr(parent, tensor_name, new_dtensor)
+
+                if EnvSetting().DEBUG and torch.distributed.get_rank() == 0:
+                    print("new value device:", new_value.device)
+                    print("setattr param", tensor_name)
+                    print("old parameter dtensor __dict__:", kwargs)
+
+
+def _loop_and_reload_fsdp2(module, delete_ckpt_name, device):
+    if EnvSetting().DEBUG and torch.distributed.get_rank() == 0:
+        print("reload module:", module)
+    for name, buffer in module.named_buffers():
+        assert hasattr(buffer, FSDPConstants.CHECKPOINT_NAME)
+        if EnvSetting().DEBUG and torch.distributed.get_rank() == 0:
+            print("reload buffer ", name, type(buffer), buffer.checkpoint_name)
+        if Path(buffer.checkpoint_name).exists():
+            loaded_buffer = torch.load(buffer.checkpoint_name)
+            if loaded_buffer.dtype is not buffer.dtype:
+                loaded_buffer = loaded_buffer.to(buffer.dtype)
+            ckpt_name = buffer.checkpoint_name if not delete_ckpt_name else None
+            delattr(buffer, FSDPConstants.CHECKPOINT_NAME)
+            _reload_meta_parameter_fsdp2(module, name, device, loaded_buffer, ckpt_name=ckpt_name, is_buffer=True)
+            setattr(buffer, FSDPConstants.CHECKPOINT_NAME, ckpt_name)
+            del loaded_buffer, buffer
+        else:
+            raise ValueError(f"meta model is not checkpointed, for {name}")
+
+    named_parameters_items = [(name, param) for name, param in module.named_parameters()]
+    for name, param in named_parameters_items:
+        assert hasattr(param, FSDPConstants.CHECKPOINT_NAME)
+        if EnvSetting().DEBUG and torch.distributed.get_rank() == 0:
+            print("reload param ", name, type(param), param.checkpoint_name)
+        if Path(param.checkpoint_name).exists():
+            loaded_param = torch.load(param.checkpoint_name)
+            if loaded_param.dtype is not param.dtype:
+                loaded_param = loaded_param.to(param.dtype)
+            ckpt_name = param.checkpoint_name if not delete_ckpt_name else None
+            old_ckpt_name = param.checkpoint_name
+            delattr(param, FSDPConstants.CHECKPOINT_NAME)
+            _reload_meta_parameter_fsdp2(module, name, device, loaded_param, ckpt_name=ckpt_name, is_buffer=False)
+            # In case param is shared by other submodules, old_ckpt_name has to be written back
+            # so the other submodules can correctly load the param
+            setattr(param, FSDPConstants.CHECKPOINT_NAME, old_ckpt_name)
+            del loaded_param, param
+        else:
+            raise ValueError(f"meta model is not checkpointed, for {name}")
+
+    for child in module.children():
+        _loop_and_reload_fsdp2(child, delete_ckpt_name, device)
+
+
+def reload_meta_module(module, device="cpu", delete_ckpt_name=True, retie_weights=True, has_fsdp2=False):
     """Reload a meta module to device, possibly do a retie_weights operation.
 
     Args:
@@ -499,91 +698,18 @@ def reload_meta_module(module, device="cpu", delete_ckpt_name=True, retie_weight
             _retie_weights(module, _tied_parameters)
         return
 
-    def _loop_and_reload(module):
-        for name, param in module.named_parameters():
-            if param.device == torch.device("meta"):
-                if hasattr(param, "checkpoint_name"):
-                    if Path(param.checkpoint_name).exists():
-                        loaded_param = torch.load(param.checkpoint_name)
-                    elif _MetaModeContext._SHARD_FLAT_PARAM_LOADER:
-                        if hasattr(param, "sync_module_states"):
-                            loaded_param = _MetaModeContext.get_current_shard_flat_loader().load_tensor_by_name(
-                                param.checkpoint_name, sync_module_states=True
-                            )
-                            delattr(param, "sync_module_states")
-                        elif hasattr(param, "intra_load"):
-                            loaded_param = _MetaModeContext.get_current_shard_flat_loader().load_with_intra_nodes(
-                                param.checkpoint_name
-                            )
-                            delattr(param, "intra_load")
-                        else:
-                            loaded_param = _MetaModeContext.get_current_shard_flat_loader().load_tensor_by_name(
-                                param.checkpoint_name
-                            )
-                    else:
-                        raise ValueError(
-                            (
-                                "reload meta module needs set `checkpoint_name`, for init, "
-                                "you needs set checkpoint_name for a file which is saved by torch. "
-                                "For load ckpt, you need to set `checkpoint_name` and use "
-                                "ShardTensorUtil to load flat param."
-                            )
-                        )
-                    if loaded_param.dtype is not param.dtype:
-                        loaded_param = loaded_param.to(param.dtype)
-                    # ckpt_name: set to the new Parameter, None if delete ckpt name
-                    # old_ckpt_name: set to the old Parameter, in case weight tying
-                    ckpt_name = param.checkpoint_name if not delete_ckpt_name else None
-                    old_ckpt_name = param.checkpoint_name
-                    # checkpoint_name attr must be deleted as this is a custom attr and is cannot be used
-                    # to initialize the new Parameter object
-                    delattr(param, "checkpoint_name")
-                    _reload_meta_parameter(module, name, device, value=loaded_param, ckpt_name=ckpt_name)
-                    # In case param is shared by other submodules, old_ckpt_name has to be written back
-                    # so the other submodules can correctly load the param
-                    setattr(param, "checkpoint_name", old_ckpt_name)
-                    del loaded_param, param
-                else:
-                    raise ValueError(f"meta model {module} is not checkpointed, for {name}")
-            elif param.device != torch.device(device):
-                logger.info("reload meta param %s", name)
-                _reload_meta_parameter(module, name, device)
-        for name, buffer in module.named_buffers():
-            if buffer.device == torch.device("meta"):
-                if hasattr(buffer, "checkpoint_name"):
-                    if Path(buffer.checkpoint_name).exists():
-                        loaded_buffer = torch.load(buffer.checkpoint_name)
-                    elif _MetaModeContext._SHARD_FLAT_PARAM_LOADER:
-                        loaded_buffer = _MetaModeContext.get_current_shard_flat_loader().load_tensor_by_name(
-                            buffer.checkpoint_name
-                        )
-                    else:
-                        raise ValueError(
-                            (
-                                "reload meta module needs set `checkpoint_name`, for init, "
-                                "you needs set checkpoint_name for a file which is saved by torch. "
-                                "For load ckpt, you need to set `checkpoint_name` and use "
-                                "ShardTensorUtil to load flat param."
-                            )
-                        )
-                    if loaded_buffer.dtype is not buffer.dtype:
-                        loaded_buffer = loaded_buffer.to(buffer.dtype)
-                    ckpt_name = buffer.checkpoint_name if not delete_ckpt_name else None
-                    old_ckpt_name = buffer.checkpoint_name
-                    delattr(buffer, "checkpoint_name")
-                    _reload_meta_parameter(module, name, device, value=loaded_buffer, ckpt_name=ckpt_name)
-                    setattr(buffer, "checkpoint_name", ckpt_name)
-                    del loaded_buffer, buffer
-                else:
-                    raise ValueError(f"meta model is not checkpointed, for {name}")
-            elif buffer.device != torch.device(device):
-                logger.info("reload meta buffer %s", name)
-                _reload_meta_parameter(module, name, device)
-
-        for child in module.children():
-            _loop_and_reload(child)
-
-    _loop_and_reload(module)
+    if has_fsdp2:
+        assert is_meta(module)
+        if getattr(module, FSDPConstants.ATORCH_CHECKPOINTED_BY_DISK_OFFLOAD, False):
+            _loop_and_reload_fsdp2(module, delete_ckpt_name, device)
+            if EnvSetting().DEBUG and torch.distributed.get_rank() == 0:
+                print("buffers:", list(module.buffers()))
+                print("parameters:", list(module.parameters()))
+            assert not is_meta(module)
+        else:
+            module.to_empty(device=device)
+    else:
+        _loop_and_reload(module, delete_ckpt_name, device)
 
     # calling to(device) in case module contains some funky attributes
     module.to(device)

@@ -4,7 +4,7 @@ import tempfile
 from contextlib import nullcontext
 
 from atorch.common.log_utils import default_logger as logger
-from atorch.trainer import AtorchTrainingArgs
+from atorch.trainer.args import AtorchTrainingArgs
 
 
 def get_profiler(args: AtorchTrainingArgs):
@@ -12,7 +12,7 @@ def get_profiler(args: AtorchTrainingArgs):
     profiler_file_path = args.profiler_file_path
     profiler_config = args.profiler_config
 
-    if profiler_type is None:
+    if profiler_type is None or profiler_type == "nsys":
         return nullcontext()
     elif profiler_type == "hw":
         import torch_npu
@@ -68,7 +68,7 @@ def get_profiler(args: AtorchTrainingArgs):
             profile_memory=False,
             schedule=torch_npu.profiler.schedule(
                 wait=args.profiler_schedule_wait,
-                warmup=args.profiler_schedule_wait,
+                warmup=args.profiler_schedule_warmup,
                 active=args.profiler_schedule_active,
                 repeat=args.profiler_schedule_repeat,
                 skip_first=args.profiler_schedule_skip_first,
@@ -111,7 +111,7 @@ def get_profiler(args: AtorchTrainingArgs):
             profile_memory=False,
             schedule=torch.profiler.schedule(
                 wait=args.profiler_schedule_wait,
-                warmup=args.profiler_schedule_wait,
+                warmup=args.profiler_schedule_warmup,
                 active=args.profiler_schedule_active,
                 repeat=args.profiler_schedule_repeat,
                 skip_first=args.profiler_schedule_skip_first,
@@ -121,5 +121,5 @@ def get_profiler(args: AtorchTrainingArgs):
         default_profiler_config.update(profiler_config)
         return torch.profiler.profile(**default_profiler_config)
     else:
-        logger.warning(f"Unsupported profiler_type:{profiler_type}. Please use one of ['hw', 'nv'].")
+        logger.warning(f"Unsupported profiler_type:{profiler_type}. Please use one of ['hw', 'hw_dp', 'nv', 'nsys'].")
         return nullcontext()

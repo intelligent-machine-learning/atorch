@@ -1,15 +1,19 @@
 import numpy as np
 import pandas as pd
-from pymoo.config import Config
-from pymoo.core.problem import Problem
-from pymoo.factory import get_algorithm, get_crossover, get_mutation
-from pymoo.operators.mixed_variable_operator import MixedVariableCrossover, MixedVariableMutation
-from pymoo.optimize import minimize
+
+try:
+    from pymoo.config import Config
+    from pymoo.core.problem import Problem
+    from pymoo.factory import get_algorithm, get_crossover, get_mutation
+    from pymoo.operators.mixed_variable_operator import MixedVariableCrossover, MixedVariableMutation
+    from pymoo.optimize import minimize
+
+    Config.show_compile_hint = False
+except (ImportError, ModuleNotFoundError):
+    Problem = object
 
 from atorch.auto.engine.sg_algo.hebo.acquisitions.acq import Acquisition
 from atorch.auto.engine.sg_algo.hebo.design_space.design_space import DesignSpace
-
-Config.show_compile_hint = False
 
 
 class BOProblem(Problem):
@@ -25,6 +29,9 @@ class BOProblem(Problem):
         self.acq = acq
         self.space = space
         self.fix = fix  # NOTE: use self.fix to enable contextual BO
+
+        if Problem == object:
+            print("Install pymoo==0.5.0 to support evolution optimizer.")
 
         super().__init__(len(lb), xl=lb, xu=ub, n_obj=acq.num_obj, n_constr=acq.num_constr)
 

@@ -6,9 +6,12 @@ import unittest
 import pytest
 import torch
 
-torch = pytest.importorskip("torch", minversion="2.0.9")
-if torch.version.git_version != "7bcf7da3a268b435777fe87c7794c382f444e86d" or not torch.cuda.is_available():
-    pytest.skip("requires pytorch 2.1 stable release", allow_module_level=True)
+from atorch.utils.version import torch_version
+
+if not torch.cuda.is_available() or torch_version() >= (2, 5, 0):  # type: ignore
+    pytest.skip("requires cuda device with torch 2.1 or 2.4", allow_module_level=True)
+
+pytestmark = pytest.mark.core24
 
 import torch.multiprocessing as mp
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -16,83 +19,21 @@ from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp.wrap import CustomPolicy
 
 import atorch
+from atorch.auto import auto_accelerate
 from atorch.common.util_func import divide, find_free_port
 from atorch.distributed.distributed import create_parallel_group, parallel_group
-from atorch.utils.fsdp_init_util import patch_fsdp_init
+from atorch.tests.toy_modules.toy_for_moe import (
+    DummyBlock,
+    DummyExperts,
+    assert_same_sd,
+    get_input,
+    get_model,
+    get_optim,
+    optim_param_func,
+)
+from atorch.tests.toy_modules.toy_for_moe import run_module_gt as run_module_gt_toy
+from atorch.utils.fsdp_init_util import clear_fsdp_patch_init, patch_fsdp_init
 from atorch.utils.fsdp_save_util import ShardOptim, save_fsdp_flat_param, save_fsdp_optim_param
-
-
-# Toy for moe
-class DummyExperts(torch.nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.w1 = torch.nn.Linear(hidden_size, hidden_size * 2)
-        self.w2 = torch.nn.Linear(hidden_size * 2, hidden_size)
-
-    def forward(self, x):
-        return self.w2(self.w1(x))
-
-
-class DummyBlock(torch.nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.bw1 = torch.nn.Linear(hidden_size, hidden_size * 2)
-        self.bw2 = torch.nn.Linear(hidden_size * 2, hidden_size)
-        self.experts = DummyExperts(hidden_size)
-
-    def forward(self, x):
-        return self.experts(self.bw2(self.bw1(x)))
-
-
-class DummyModel(torch.nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.mw1 = torch.nn.Linear(hidden_size, hidden_size * 2)
-        self.mw2 = torch.nn.Linear(hidden_size * 2, hidden_size)
-        self.layers = torch.nn.ModuleList(DummyBlock(hidden_size) for _ in range(3))
-
-    def forward(self, x):
-        x = self.mw2(self.mw1(x))
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-
-def get_model(hidden_size, seed=123, meta=False):
-    torch.cuda.manual_seed(seed)
-    torch.manual_seed(seed)
-    if meta:
-        with torch.device("meta"):
-            model = DummyModel(hidden_size)
-    else:
-        model = DummyModel(hidden_size).cuda()
-    return model
-
-
-def get_input(hidden_size, seed=123):
-    diff_seed = seed + torch.distributed.get_rank()
-    torch.cuda.manual_seed(diff_seed)
-    torch.manual_seed(diff_seed)
-    return torch.randn(4, hidden_size, device=torch.device("cuda"))
-
-
-def get_optim(model):
-    def optim_param_func(model):
-        no_decay = ["bias", "LayerNorm.weight", "layernorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": 0.1,
-            },
-            {
-                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
-        ]
-        return optimizer_grouped_parameters
-
-    optim = torch.optim.AdamW(optim_param_func(model), lr=0.001)
-    return optim
 
 
 def init_moe_group():
@@ -180,16 +121,80 @@ def run_module_load(rank, world_size, hidden_size, gt_ckpt):
     assert_same_sd(ref_optim.state_dict(), load_optim.state_dict())
 
 
-def assert_same_sd(ref_sd, load_sd):
-    assert set(ref_sd.keys()) == set(load_sd.keys()), (
-        f"{[k for k in ref_sd.keys() if k not in load_sd.keys()]} "
-        f"{[k for k in load_sd.keys() if k not in ref_sd.keys()]}"
+def run_module_double_load(rank, world_size, hidden_size, gt_ckpt, use_cpu_offload=False):
+    # ref_model
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+
+    init_moe_group()
+    fp16_dtype = torch.float16
+    fsdp_config = {
+        "use_orig_params": True,
+        "sync_module_states": True,
+        "mixed_precision": MixedPrecision(param_dtype=fp16_dtype, reduce_dtype=fp16_dtype, buffer_dtype=fp16_dtype),
+        "auto_wrap_policy": CustomPolicy(moe_fsdp_policy_fn),
+    }
+
+    if use_cpu_offload:
+        fsdp_config["cpu_offload"] = True
+    # patch fsdp init load need sync_module_states to be False and to_empty param_init_fn
+    fsdp_config["sync_module_states"] = False
+    fsdp_config["param_init_fn"] = lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
+    strategy = [("fsdp", fsdp_config)]
+
+    # load_model
+    load_model1 = get_model(hidden_size, meta=True)
+    patch_fsdp_init(
+        gt_ckpt,
+        (DummyBlock, DummyExperts),
+        load_model1,
     )
-    for k in ref_sd.keys():
-        if isinstance(ref_sd[k], dict):
-            assert_same_sd(ref_sd[k], load_sd[k])
-        elif isinstance(ref_sd[k], torch.Tensor):
-            assert torch.all(ref_sd[k] == load_sd[k]), f"{k}\nref_sd\n{ref_sd[k]}\nload_sd\n{load_sd[k]}"
+
+    _, result1, _ = auto_accelerate(
+        load_model1,
+        torch.optim.AdamW,
+        loss_func=lambda x: x["logits"],
+        optim_args={"lr": 0.001},
+        load_strategy=strategy,
+        optim_param_func=optim_param_func,
+        ignore_dryrun_on_load_strategy=True,
+    )
+    model1 = result1.model
+    optim1 = result1.optim
+    print("load_model1:", model1.sharding_strategy)
+
+    # clear patch
+    clear_fsdp_patch_init()
+
+    load_model2 = get_model(hidden_size, meta=True)
+    patch_fsdp_init(
+        gt_ckpt,
+        (DummyBlock, DummyExperts),
+        load_model2,
+    )
+    _, result2, _ = auto_accelerate(
+        load_model2,
+        torch.optim.AdamW,
+        loss_func=lambda x: x["logits"],
+        optim_args={"lr": 0.001},
+        load_strategy=strategy,
+        optim_param_func=optim_param_func,
+        ignore_dryrun_on_load_strategy=True,
+    )
+    model2 = result2.model
+    optim2 = result2.optim
+    print("load_model2:", model2.sharding_strategy)
+
+    # train
+    input_data = get_input(hidden_size)
+    loss1 = model1(input_data).mean()
+    loss1.backward()
+    optim1.step()
+
+    loss2 = model2(input_data).mean()
+    loss2.backward()
+    optim2.step()
 
 
 class FSDPMoEShardSaveLoadTest(unittest.TestCase):
@@ -226,6 +231,7 @@ class FSDPMoEShardSaveLoadTest(unittest.TestCase):
         not torch.cuda.is_available() or torch.cuda.device_count() < 4,
         "Must have at least 4 GPUs for gpu test",
     )
+    @pytest.mark.core24
     def test_toy_load(self):
         """This test will load toy module"""
         os.environ["WORLD_SIZE"] = str(self.world_size)
@@ -237,6 +243,75 @@ class FSDPMoEShardSaveLoadTest(unittest.TestCase):
             run_module_load,
             nprocs=self.world_size,
             args=(self.world_size, self.hidden_size, self.gt_ckpt),
+            join=True,
+            daemon=False,
+            start_method="spawn",
+        )
+        atorch.reset_distributed()
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 4,
+    "Must have at least 4 GPUs for gpu test",
+)
+class FSDPMoEDPOTest(unittest.TestCase):
+    def __init__(self, methodName="runTest", world_size=None, hidden_size=None):
+        super(FSDPMoEDPOTest, self).__init__(methodName)
+        self.world_size = world_size or 4
+        self.hidden_size = hidden_size or 64
+        self.gt_ckpt = f"/tmp/fsdp_moe_dpo_test/gt"
+        self._prepare_toy_save()
+
+    def setUp(self):
+        atorch.reset_distributed()
+
+    def _prepare_toy_save(self):
+        """This test will save toy module"""
+
+        if os.path.exists("/tmp/fsdp_moe_dpo_test/"):
+            shutil.rmtree("/tmp/fsdp_moe_dpo_test/")
+        os.environ["WORLD_SIZE"] = str(self.world_size)
+        os.environ["NPROC_PER_NODE"] = str(self.world_size)
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        mp.spawn(
+            run_module_gt_toy,
+            nprocs=self.world_size,
+            args=(self.world_size, self.hidden_size, self.gt_ckpt),
+            join=True,
+            daemon=False,
+            start_method="spawn",
+        )
+        atorch.reset_distributed()
+
+    def test_fsdp_double_init_and_accerate(self):
+        os.environ["WORLD_SIZE"] = str(self.world_size)
+        os.environ["NPROC_PER_NODE"] = str(self.world_size)
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        os.environ["NVTE_TORCH_COMPILE"] = str(0)
+
+        mp.spawn(
+            run_module_double_load,
+            nprocs=self.world_size,
+            args=(self.world_size, self.hidden_size, self.gt_ckpt),
+            join=True,
+            daemon=False,
+            start_method="spawn",
+        )
+        atorch.reset_distributed()
+
+    def test_fsdp_cpu_offload(self):
+        os.environ["WORLD_SIZE"] = str(self.world_size)
+        os.environ["NPROC_PER_NODE"] = str(self.world_size)
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        os.environ["NVTE_TORCH_COMPILE"] = str(0)
+
+        mp.spawn(
+            run_module_double_load,
+            nprocs=self.world_size,
+            args=(self.world_size, self.hidden_size, self.gt_ckpt, True),
             join=True,
             daemon=False,
             start_method="spawn",

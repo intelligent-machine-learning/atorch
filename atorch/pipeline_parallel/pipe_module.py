@@ -30,6 +30,19 @@ class PipeModuleConfig:
         sche_name="Schedule1F1B",
         n_microbatches=1,
     ):
+        """
+        manual_stage_partition: if None, evenly partition model layers into pp stages.
+            if not None, it is either:
+            (1) List[int], each stage's layer number.
+            List length equals to stage num, and sum of the list equals to total_layer_num.
+            (2) Dict[int:int], key is stage id, and corresponding value is this stage's layer num.
+            Other stages would be evenly partitioned.
+            For stage_num=4, and total_layer_num=16, if manual_stage_partition=None, the 4 stages
+            would have [4, 4, 4, 4] layers. If total_layer_num=14, then [4, 4, 3, 3]
+            If total_layer_num=14 and manual_stage_partition=[3, 4, 4, 3], then stage 0 and 3 would get
+            3 layers instead of stage 2 and 3.
+            If manual_stage_partition={0:3; 3:3}, this will result in the same partition 【3, 4, 4, 3】
+        """
         self.partition_method = partition_method
         self.manual_stage_partition = manual_stage_partition
         self.model_config = model_config

@@ -6,9 +6,8 @@ import torch.distributed as dist
 from torch.distributed.algorithms.model_averaging.averagers import ModelAverager
 from torch.distributed.algorithms.model_averaging.utils import average_parameters, get_params_to_average
 
-from atorch.local_sgd.anomaly_detection import OnlineDynamicEWMA
-from atorch.local_sgd.HSDP.configs import GTAConfigs, LocalSGDConfigs, OuterOptimizerConfigs
-from atorch.local_sgd.reduce_methods import GTAReducer, LinearReducer, TensorReducer
+from atorch.local_sgd.configs import GTAConfig, LocalSGDConfig, OuterOptimizerConfig
+from atorch.local_sgd.utils import GTAReducer, LinearReducer, OnlineDynamicEWMA, TensorReducer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -19,14 +18,14 @@ class OuterOptimPeriodicModelAverager(ModelAverager):
     def __init__(
         self,
         process_group=None,
-        local_sgd_config: Optional[LocalSGDConfigs] = None,
-        gta_config: Optional[GTAConfigs] = None,
-        outer_optim_config: Optional[OuterOptimizerConfigs] = None,
+        local_sgd_config: Optional[LocalSGDConfig] = None,
+        gta_config: Optional[GTAConfig] = None,
+        outer_optim_config: Optional[OuterOptimizerConfig] = None,
     ):
         super().__init__(process_group)
-        self.local_sgd_config = LocalSGDConfigs() if local_sgd_config is None else local_sgd_config
-        self.gta_config = GTAConfigs() if gta_config is None else gta_config
-        self.outer_optim_config = OuterOptimizerConfigs() if outer_optim_config is None else outer_optim_config
+        self.local_sgd_config = LocalSGDConfig() if local_sgd_config is None else local_sgd_config
+        self.gta_config = GTAConfig() if gta_config is None else gta_config
+        self.outer_optim_config = OuterOptimizerConfig() if outer_optim_config is None else outer_optim_config
 
         # Just register common local sgd args
         self.warmup_steps = self.local_sgd_config.local_sgd_warmup_steps
@@ -43,7 +42,7 @@ class OuterOptimPeriodicModelAverager(ModelAverager):
         self.outer_optimizer: Optional[torch.optim.Optimizer] = None
         self.last_synced_weights = None
         self.outer_optim_state_dict = None
-        self.reduce: Optional[TensorReducer] = None
+        self.reducer: Optional[TensorReducer] = None
         if self.gta_config.reducer == "linear":
             self.reducer = LinearReducer(
                 process_group=self.process_group,

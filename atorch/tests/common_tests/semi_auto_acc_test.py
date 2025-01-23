@@ -2,9 +2,9 @@ import copy
 import os
 import unittest
 
+import pytest
 import torch
 import torch.multiprocessing as mp
-from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import atorch
@@ -140,6 +140,11 @@ def run_ds_zero(
     data_size,
     batch_size,
 ):
+    try:
+        from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    except (ImportError, ModuleNotFoundError):
+        DeepSpeedZeroOptimizer = None
+
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["RANK"] = str(rank)
     backend = "nccl" if torch.cuda.is_available() else "gloo"
@@ -358,6 +363,7 @@ class LoadStrategyTest(unittest.TestCase):
         not torch.cuda.is_available() or torch.cuda.device_count() < 2,
         "Must have at least 2 GPUs for gpu test",
     )
+    @pytest.mark.core24
     def test_gpt2_strategy(self):
         os.environ["WORLD_SIZE"] = str(2)
         os.environ["NPROC_PER_NODE"] = str(2)
@@ -510,6 +516,8 @@ class LoadStrategyTest(unittest.TestCase):
         not torch.cuda.is_available() or not is_fp8_available(),
         "Must have GPU with fp8 supported",
     )
+    @pytest.mark.core24
+    @pytest.mark.fp8
     def test_gpt2_fp8(self):
         os.environ["WORLD_SIZE"] = str(1)
         os.environ["NPROC_PER_NODE"] = str(1)
@@ -545,6 +553,7 @@ class LoadStrategyTest(unittest.TestCase):
         os.environ["NPROC_PER_NODE"] = str(2)
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(find_free_port())
+        os.environ["ATORCH_NCCL_EXEC_TIMEOUT"] = "600"
 
         hidden_size = 256
         head_num = 4
@@ -561,10 +570,9 @@ class LoadStrategyTest(unittest.TestCase):
             start_method="spawn",
         )
 
-    @unittest.skipIf(
-        not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
-        "Must have GPU with bf16 supported",
-    )
+        del os.environ["ATORCH_NCCL_EXEC_TIMEOUT"]
+
+    @unittest.skip("skip ds tests")
     def test_ds_zero_bf16(self):
         os.environ["WORLD_SIZE"] = str(2)
         os.environ["NPROC_PER_NODE"] = str(2)

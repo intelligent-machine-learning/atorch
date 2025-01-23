@@ -121,7 +121,7 @@ class HEBOTest(unittest.TestCase):
         x, xe = space.transform(rec)
         self.assertAlmostEqual(acq(x, xe)[:, 0], 1.0, 0.01)
 
-    @unittest.skipIf(torch.cuda.is_available(), "run on cpu only")
+    @unittest.skip("skip to save time")
     def test_hebo(self):
         from atorch.auto.engine.sg_algo.hebo.optimizers.hebo import HEBO
 

@@ -4,7 +4,6 @@ import os
 import subprocess
 import sys
 
-import setuptools.command.build_py
 from setuptools import find_packages, setup
 
 from atorch.ops.op_builder import get_default_compute_capabilities

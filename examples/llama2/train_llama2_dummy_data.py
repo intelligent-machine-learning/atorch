@@ -14,7 +14,10 @@ from atorch.auto.accelerate import auto_accelerate
 from atorch.auto.model_context import get_data_partition_rank_and_size
 from atorch.common.util_func import data_to_device
 from atorch.distributed.distributed import destroy_parallel_group
+from atorch.utils.import_util import is_torch_npu_available
 from atorch.utils.meta_model_utils import init_empty_weights_with_disk_offload
+from atorch.utils.moe_util import move_optimizer_state
+from atorch.utils.version import torch_version
 
 
 def llama_loss_func(inputs, output):
@@ -125,20 +128,26 @@ def parse_args():
     parser.add_argument("--timeout_sec", type=int, default=1800, required=False)
 
     parser.add_argument("--use_fsdp", default=False, action="store_true")
+    parser.add_argument("--use_fsdp2", default=False, action="store_true")
     parser.add_argument("--use_amp", default=False, action="store_true")
     parser.add_argument("--use_fp8", default=False, action="store_true")
+    parser.add_argument("--use_precision_switchable_fp8", default=False, action="store_true")
+    parser.add_argument("--use_precision_switchable_fp8_with_input_current_scaling", default=False, action="store_true")
     parser.add_argument("--use_checkpointing", default=False, action="store_true")
     parser.add_argument("--use_module_replace", default=False, action="store_true")
     parser.add_argument("--use_meta_init", default=False, action="store_true")
     parser.add_argument("--use_distributed_dataloader", default=False, action="store_true")
     parser.add_argument("--max_checkpoint_module_num", type=int, default=-1, required=False)
     parser.add_argument("--npu", default=False, action="store_true")
+    parser.add_argument("--offload_optimizer_state", default=False, action="store_true")
+    parser.add_argument("--fsdp_cpu_offload", default=False, action="store_true")
 
     return parser.parse_args()
 
 
 def get_strategy(args):
-    strategy = ["parallel_mode"]
+    parallel_mode = ([("data", torch.distributed.get_world_size())], None, False, True)
+    strategy = [("parallel_mode", parallel_mode)]
     if args.use_module_replace:
         strategy.append("module_replace")
     if args.use_fsdp:
@@ -148,7 +157,16 @@ def get_strategy(args):
             "forward_prefetch": True,
             "atorch_wrap_cls": (LlamaDecoderLayer,),
         }
+        if args.fsdp_cpu_offload:
+            fsdp_config["cpu_offload"] = True
+            current_device = torch.cuda.current_device()
+            fsdp_config["device_id"] = current_device
         strategy.append(("fsdp", fsdp_config))
+    elif args.use_fsdp2:
+        fsdp_config = {
+            "atorch_wrap_cls": (LlamaDecoderLayer,),
+        }
+        strategy.append(("fsdp2", fsdp_config))
     if args.optim_grouped_params:
         fsdp_config["use_orig_params"] = True
     if args.use_amp:
@@ -160,14 +178,26 @@ def get_strategy(args):
         if args.max_checkpoint_module_num >= 0:
             checkpoint_config["max_checkpoint_module_num"] = args.max_checkpoint_module_num
         strategy.append(("checkpoint", checkpoint_config))
-    if args.use_fp8:
-        strategy.append(("fp8", {"include": ("layers",)}))
+    if (
+        args.use_fp8
+        or args.use_precision_switchable_fp8
+        or args.use_precision_switchable_fp8_with_input_current_scaling
+    ):
+        fp8_config = {"include": ("layers",)}
+        if args.use_precision_switchable_fp8:
+            fp8_config["precision_switchable"] = True
+        if args.use_precision_switchable_fp8_with_input_current_scaling:
+            fp8_config["precision_switchable"] = True
+            fp8_config["precision_switchable_fp8_input_current_scaling"] = True
+
+        strategy.append(("fp8", fp8_config))
     return strategy
 
 
 def train(args):
     timeout = timedelta(seconds=args.timeout_sec)
     atorch.init_distributed("nccl", set_cuda_device_using_local_rank=True, timeout=timeout)
+
     if atorch.rank() == 0:
         print("Args is ", args)
 
@@ -176,6 +206,11 @@ def train(args):
     c_s += f"num_key_value_heads={args.key_value_head_num},max_position_embeddings={args.seq_length},"
     c_s += f"intermediate_size={args.intermediate_size}"
     model_config.update_from_string(c_s)
+    if is_torch_npu_available() and torch_version() >= (2, 4, 0):
+        model_config._attn_implementation = "sdpa"
+    else:
+        model_config._attn_implementation = "flash_attention_2"
+    model_config.use_cache = False
 
     st = time.time()
     model = get_model(model_config, meta_init=args.use_meta_init)
@@ -246,7 +281,12 @@ def train(args):
         outputs = model(**batch)
         loss = loss_func(batch, outputs)
         loss.backward()
+
+        if args.offload_optimizer_state:
+            move_optimizer_state(optim, device="cuda")
         optim.step()
+        if args.offload_optimizer_state:
+            move_optimizer_state(optim, device="cpu")
         global_step += 1
         if global_step % args.log_interval == 0 and atorch.rank() == 0:
             cur_time = time.time()
@@ -275,6 +315,7 @@ def train(args):
             print(f"Average : {avg_step_time} sec/step.")
             print(f"Average thoughput: {avg_throughput} sample/sec, {avg_throughput_token} token/gpu/sec.")
             print(f"max_memory_reserved={avg_max_reserved} MB, max_memory_allocated={avg_max_allocated} MB.")
+    torch.distributed.barrier()
     destroy_parallel_group()
 
 

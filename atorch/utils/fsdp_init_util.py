@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple, Type, Union, no_type_check
 
 try:
-    from collections import abs as collections_abc  # type: ignore[attr-defined]
+    from collections import abc as collections_abc  # type: ignore[attr-defined]
 except ImportError:
     import collections as collections_abc  # type: ignore[no-redef]
 
@@ -38,6 +38,7 @@ else:
     OriginFlatParamHandle = object
 
 TORCH_210_GIT_VERSION = "7bcf7da3a268b435777fe87c7794c382f444e86d"
+TORCH_212_GIT_VERSION = "a8e7c98cb95ff97bb30a728c6b2a1ce6bff946eb"
 TORCH_240_GIT_VERSION = "e4ee3be4063b7c430974252fdf7db42273388d86"
 
 
@@ -54,7 +55,7 @@ def patch_fsdp_init(ckpt_path, wrap_class, top_model, check_module=True, ignore_
     It is dangerous to patch core functions in FSDP, so we only support pt2.1.0.
     """
     version = torch.version.git_version
-    if version in (TORCH_210_GIT_VERSION, TORCH_240_GIT_VERSION):
+    if version in (TORCH_210_GIT_VERSION, TORCH_212_GIT_VERSION, TORCH_240_GIT_VERSION):
         RestoreFlatParamHandle.GLOBAL_CONFIG.build_ckpt_util(ckpt_path, wrap_class, top_model)
         if not check_module:
             logger.warn("Ignore module checkint, make sure your wrap class in FSDP is same")
@@ -67,7 +68,7 @@ def patch_fsdp_init(ckpt_path, wrap_class, top_model, check_module=True, ignore_
                 ErrorCode.CHECKPOINT_WRAP_CLASS_MISMATCH,
             )
 
-        if version == TORCH_210_GIT_VERSION:
+        if version in (TORCH_210_GIT_VERSION, TORCH_212_GIT_VERSION):
             RestoreFlatParamHandle.shard = RestoreFlatParamHandle.mock_shard_pt210
             FSDP._init_param_handle_from_module = mock_init_param_handle_from_module_pt210
         elif version == TORCH_240_GIT_VERSION:

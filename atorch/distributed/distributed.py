@@ -392,6 +392,19 @@ def get_device_mesh(group_name, use_prefix=True):
 
     for device_mesh in _DistributedContext.DEVICE_MESHES:
         if pname in device_mesh.mesh_dim_names:
+            return device_mesh[pname]
+
+    return None
+
+
+def get_root_device_mesh(group_name, use_prefix=True):
+    if use_prefix:
+        pname = _prefix_pg_name(group_name)
+    else:
+        pname = group_name
+
+    for device_mesh in _DistributedContext.DEVICE_MESHES:
+        if pname in device_mesh.mesh_dim_names:
             return device_mesh
 
     return None
@@ -413,14 +426,19 @@ def init_distributed_context_from_mesh(name, size, device_mesh):
     _DistributedContext.PARALLEL_GROUP_SIZE[pname] = size
 
 
-def create_parallel_group(parallel_config, use_atorch_pipe=True, use_device_mesh=False):
+def create_parallel_group(parallel_config, use_atorch_pipe=True, use_device_mesh=False, reverse_mesh_pg_order=True):
     """
     Create additional groups for mixed parallel when needed.
-    parallel_config: (List[Tuple[str, int]], Oneof(List(int), None), Optional(Bool))
+    parallel_config: (List[Tuple[str, int]], Oneof(List(int), None), Optional(Bool), Optional(Bool))
+    use_atorch_pipe: use pytorch's pipe instead of Pippy.
+    use_device_mesh: use pytorch DeviceMesh for pg creation.
+    reverse_mesh_pg_order: device_mesh order is the reverse order of atorch parallel_config order. Default True to be
+        consistent with atorch and device mesh.
     The first item is a list of (name, size) for mixed parallel.
     MUL(size) should equal to the number of processes if support_multi_parallel_instance is False.
     The second item for rank order. if None, using the numeric order.
     The third item is for support_multi_parallel_instance, which is optional with default value as False.
+    The fourth item is for use_device_mesh, which is optional with default value as False.
     For example, ([("tensor", 4), ("pipeline", 2), ("data", 2)], None) would create:
     4 process groups for "tensor" [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]
     8 process groups for "pipeline" [0, 4], [1, 5], [2, 6], [3, 7], [8, 12], [9, 13], [10, 14], [11, 15]
@@ -431,6 +449,7 @@ def create_parallel_group(parallel_config, use_atorch_pipe=True, use_device_mesh
     slicing_dim = parallel_config[0]
     rank_order = parallel_config[1]
     support_multi_parallel_instance = parallel_config[2] if len(parallel_config) > 2 else False
+    use_device_mesh = use_device_mesh or (parallel_config[3] if len(parallel_config) > 3 else False)
     assert len(slicing_dim) > 0, "parallel_config should not be empty"
     multiplication = np.prod([p[1] for p in slicing_dim])
     if not support_multi_parallel_instance:
@@ -493,7 +512,7 @@ def create_parallel_group(parallel_config, use_atorch_pipe=True, use_device_mesh
             has_pipe = True
     else:
         if use_device_mesh:
-            device_mesh = build_mesh(slicing_dim, _DistributedContext.PG_NAME_PREFIX)
+            device_mesh = build_mesh(slicing_dim, _DistributedContext.PG_NAME_PREFIX, reverse_mesh_pg_order)
             if _DistributedContext.DEVICE_MESHES is None:
                 _DistributedContext.DEVICE_MESHES = [device_mesh]
             else:
@@ -862,7 +881,7 @@ def init_distributed(
     """
 
     backend = backend.lower()
-    backend_choices = ["nccl", "gloo", "accl", "hccl"]
+    backend_choices = ["nccl", "gloo", "accl", "hccl", "cpu:gloo,cuda:nccl"]
     if backend not in backend_choices:
         logger.error("Invalid backend {}. Only support {}".format(backend, backend_choices))
         return False
@@ -898,6 +917,16 @@ def init_distributed(
             except Exception as e:
                 logger.error(f"Failed to get nccl version. {str(e)}")
                 return False
+            if timeout == default_pg_timeout:
+                # if user doesn't set its customized timeout, we will check out the os environment
+                # it is flexible for us to set nccl timeout for different product environment
+                # the maximum is not bigger than default timeout
+                nccl_exec_timeout = os.getenv("ATORCH_NCCL_EXEC_TIMEOUT", "")
+                if nccl_exec_timeout.isdigit():
+                    nccl_timeout_seconds = int(nccl_exec_timeout)
+                    if nccl_timeout_seconds is not None and timeout.seconds > nccl_timeout_seconds:
+                        timeout = timedelta(seconds=nccl_timeout_seconds)
+
         elif backend == "accl":
             try:
                 import torch_accl  # noqa: F401

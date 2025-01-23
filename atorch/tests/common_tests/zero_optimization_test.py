@@ -3,9 +3,16 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
-from fairscale.nn.misc import ParamBucket
-from fairscale.optim.oss import OSS
+
+try:
+    from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
+    from fairscale.nn.misc import ParamBucket
+    from fairscale.optim.oss import OSS
+
+    from atorch.utils.patch_fairscale import patch_add_param_as_view, patch_setup_flat_buffers
+except (ImportError, ModuleNotFoundError):
+    ShardedDDP = None
+
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -14,7 +21,6 @@ from atorch.auto import auto_accelerate
 from atorch.auto.opt_lib.utils import to_module_class_by_name
 from atorch.auto.opt_lib.zero_optimization import FSDPOptimization, Zero1Optimization, Zero2Optimization
 from atorch.tests.toy_modules.toy_module import ToyCustomModule, create_model_context
-from atorch.utils.patch_fairscale import patch_add_param_as_view, patch_setup_flat_buffers
 from atorch.utils.version import torch_version
 
 
@@ -30,30 +36,29 @@ class ZeroOptimizationTest(unittest.TestCase):
         fsdp_optimization = FSDPOptimization()
 
         # test zero1
-        zero1_model_context = copy.deepcopy(self.model_context)
-        zero1_model_context = zero1_optimization.transform(zero1_model_context, config=None)
-        self.assertIsInstance(zero1_model_context.create_optim(), OSS)
+        if ShardedDDP is not None:
+            zero1_model_context = copy.deepcopy(self.model_context)
+            zero1_model_context = zero1_optimization.transform(zero1_model_context, config=None)
+            self.assertIsInstance(zero1_model_context.create_optim(), OSS)
 
         # test zero2
-        zero2_model_context = copy.deepcopy(self.model_context)
-        zero2_model_context = zero2_optimization.transform(zero2_model_context, None)
-        zero2_model_context.apply_wrappers(is_pre_wrapper=True)
-        zero2_model_context.update_optim()
-        zero2_model_context.apply_wrappers(is_pre_wrapper=False)
-        if torch_version() < (1, 12, 0) or not torch.cuda.is_available():
-            self.assertIsInstance(zero2_model_context.optim, OSS)
-            self.assertIsInstance(zero2_model_context.model, ShardedDDP)
-        else:
+        if torch_version() >= (1, 12, 0) and torch.cuda.is_available():
+            zero2_model_context = copy.deepcopy(self.model_context)
+            zero2_model_context = zero2_optimization.transform(zero2_model_context, None)
+            zero2_model_context.apply_wrappers(is_pre_wrapper=True)
+            zero2_model_context.update_optim()
+            zero2_model_context.apply_wrappers(is_pre_wrapper=False)
             self.assertIsInstance(zero2_model_context.model, FSDP)
 
         # test zero2 with not_use_fsdp
-        zero2_model_context = copy.deepcopy(self.model_context)
-        zero_conf = {"sync_models_at_startup": True, "not_use_fsdp": True}
-        zero2_model_context = zero2_optimization.transform(zero2_model_context, config=zero_conf)
-        zero2_model_context.update_optim()
-        zero2_model_context.apply_wrappers(is_pre_wrapper=False)
-        self.assertTrue("zero2" in zero2_model_context.post_wrappers)
-        self.assertIsInstance(zero2_model_context.model, ShardedDDP)
+        if ShardedDDP is not None:
+            zero2_model_context = copy.deepcopy(self.model_context)
+            zero_conf = {"sync_models_at_startup": True, "not_use_fsdp": True}
+            zero2_model_context = zero2_optimization.transform(zero2_model_context, config=zero_conf)
+            zero2_model_context.update_optim()
+            zero2_model_context.apply_wrappers(is_pre_wrapper=False)
+            self.assertTrue("zero2" in zero2_model_context.post_wrappers)
+            self.assertIsInstance(zero2_model_context.model, ShardedDDP)
 
         # test fsdp, gpu only
         if torch.cuda.is_available():
@@ -191,6 +196,7 @@ class ZeroOptimizationTest(unittest.TestCase):
             self.assertEqual(param.device.type, "cpu")
         atorch.reset_distributed()
 
+    @unittest.skipIf(ShardedDDP is None, "skip when fairscale is not isntalled.")
     def test_fairscale_patch(self):
         self.assertEqual(OSS._setup_flat_buffers, patch_setup_flat_buffers)
         self.assertEqual(ParamBucket._add_param_as_view, patch_add_param_as_view)

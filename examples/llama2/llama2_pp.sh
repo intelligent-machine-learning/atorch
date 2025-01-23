@@ -12,7 +12,7 @@ SEQ_LENGTH=1024
 BATCHSIZE_PER_GPU=8
 TRAIN_STEP=30
 
-PP_STAGE_NUM=8
+PP_STAGE_NUM=16
 PP_NUM=8
 
 EXTRA_PARAM=
@@ -68,4 +68,5 @@ python -m atorch.distributed.run \
     --max_train_step $TRAIN_STEP \
     --batchsize_per_gpu $BATCHSIZE_PER_GPU  $EXTRA_PARAM \
     --pp_stage_num $PP_STAGE_NUM --pp_num $PP_NUM \
-    --use_atorch_pp --pp_schedule 1F1B
+    --pp_schedule Interleaved1F1B \
+    --use_atorch_pp

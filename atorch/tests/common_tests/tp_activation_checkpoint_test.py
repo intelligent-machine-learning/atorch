@@ -128,7 +128,7 @@ class TestTPMLP(unittest.TestCase):
         except FileNotFoundError:
             pass
 
-    @unittest.skipIf(True, "init_process_group timeout error")
+    @unittest.skipIf(True, "skip fairscale tests.")
     def test_tp_checkpointing(self):
         world_size = 2
         mp.spawn(

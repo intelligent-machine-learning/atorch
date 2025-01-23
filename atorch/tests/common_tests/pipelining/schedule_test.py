@@ -2,6 +2,7 @@ import copy
 import os
 import unittest
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -12,6 +13,8 @@ from atorch.common.util_func import find_free_port
 from atorch.pipeline_parallel.pipe_stage import PipeStage
 from atorch.utils.version import torch_version
 
+pytestmark = pytest.mark.core24
+
 skip = None
 if torch_version() >= (2, 4, 0):  # type: ignore
     from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleInterleaved1F1B
@@ -21,6 +24,15 @@ else:
     skip = True
     PipelineStage, Schedule1F1B, ScheduleInterleaved1F1B = None, None, None  # type: ignore
 
+
+skip_zero_bubble = False
+if torch_version() >= (2, 5, 0):  # type: ignore
+    from torch.distributed.pipelining import ScheduleInterleavedZeroBubble
+
+    skip_zero_bubble = False
+else:
+    skip_zero_bubble = True
+    ScheduleInterleavedZeroBubble = None  # type: ignore
 
 d_hid = 512
 batch_size = 256
@@ -110,7 +122,7 @@ def run_grad_with_manual(rank, world_size, use_atorch=False):
     atorch.reset_distributed()
 
 
-def run_grad_with_manual_interleaved(rank, world_size, use_atorch=False):
+def run_grad_with_manual_interleaved(rank, world_size, use_atorch=False, ScheClass=None):
     create_pipe_group(rank)
 
     device = torch.cuda.current_device()
@@ -167,7 +179,10 @@ def run_grad_with_manual_interleaved(rank, world_size, use_atorch=False):
         ]
 
     # Attach to a schedule
-    schedule = ScheduleInterleaved1F1B(stages, chunks, loss_fn=loss_fn)
+    if ScheClass is not None:
+        schedule = ScheClass(stages, chunks, loss_fn=loss_fn)
+    else:
+        schedule = ScheduleInterleaved1F1B(stages, chunks, loss_fn=loss_fn)
 
     # Run
     for _ in range(2):
@@ -210,6 +225,10 @@ def run_grad_with_manual_interleaved(rank, world_size, use_atorch=False):
     atorch.reset_distributed()
 
 
+def run_schedule_with_zero_bubble(rank, world_size, use_atorch=False):
+    run_grad_with_manual_interleaved(rank, world_size, use_atorch, ScheClass=ScheduleInterleavedZeroBubble)
+
+
 @unittest.skipIf(torch.cuda.device_count() < 2 or skip, "Requires 2 gpus.")
 class ScheduleTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -234,6 +253,32 @@ class ScheduleTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = str(world_size)
         mp.spawn(
             run_grad_with_manual,
+            args=(world_size, True),
+            nprocs=world_size,
+            join=True,
+        )
+
+    @unittest.skipIf(skip_zero_bubble, "Make sure torch version >=2.5")
+    def test_schedule_with_zero_bubble(self):
+        world_size = 2
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        os.environ["WORLD_SIZE"] = str(world_size)
+        mp.spawn(
+            run_schedule_with_zero_bubble,
+            args=(world_size, False),
+            nprocs=world_size,
+            join=True,
+        )
+
+    @unittest.skipIf(skip_zero_bubble, "Make sure torch version >=2.5")
+    def test_schedule_with_zero_bubble_atorch(self):
+        world_size = 2
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        os.environ["WORLD_SIZE"] = str(world_size)
+        mp.spawn(
+            run_schedule_with_zero_bubble,
             args=(world_size, True),
             nprocs=world_size,
             join=True,

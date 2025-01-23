@@ -11,10 +11,13 @@ from .extensions.npu.fused_cross_entropy_npu import npu_fuse_cross_entropy_loss
 from .extensions.npu.fused_permute_npu import npu_fused_permute
 from .extensions.npu.fused_unpermute_npu import npu_fused_unpermute
 from .extensions.npu.rms_norm_npu import npu_rms_norm
+from .extensions.te.moe_func import te_permute, te_unpermute
 from .extensions.xla.flash_attention_xla import xla_flash_attn, xla_flash_attn_varlen
 from .triton_jit.atorch_layer_norm import AtorchLayerNormFunc, atorch_layer_norm
 from .triton_jit.bias_gather_add import bias_gather_add
 from .triton_jit.cross_entropy import cross_entropy_loss
+from .triton_jit.rope import liger_rotary_pos_emb
+from .triton_jit.swiglu import liger_fused_silu
 
 __all__ = [
     "bias_gather_add",
@@ -38,4 +41,8 @@ __all__ = [
     "flash_attn_unpadded_func_1",
     "flash_attn_func_3",
     "flash_attn_varlen_func_3",
+    "te_permute",
+    "te_unpermute",
+    "liger_fused_silu",
+    "liger_rotary_pos_emb",
 ]

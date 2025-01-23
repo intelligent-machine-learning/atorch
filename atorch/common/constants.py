@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -105,3 +106,10 @@ class TrainInfo:
 
     DATASETS = ["train.*data.*", "data.*path.*", "data.*dir.*"]
     MODEL_PATH = ["output.*dir.*", "output.*path.*"]
+
+
+@dataclass
+class FSDPConstants:
+    CHECKPOINT_NAME = "checkpoint_name"
+    ATORCH_FSDP2_SHARDED = "atorch_fsdp2_sharded"
+    ATORCH_CHECKPOINTED_BY_DISK_OFFLOAD = "atorch_checkpointed_by_disk_offload"

@@ -22,7 +22,7 @@ by the following steps.
 - `bash dev/scripts/pre-commit.sh`
 - `exit`
 - ```docker run -v `pwd`:/dlrover -it easydl/atorch:iml_pt210 /bin/bash```
-- `pip install pytest dlrover[torch] fairscale==0.4.1 pandas Gpy `
+- `pip install pytest dlrover[torch] pandas Gpy `
 - `pip install accelerate datasets==2.14.6 peft==0.4.0 scikit-learn pymoo==0.5.0`
 - `echo -e 'import math\ninf = math.inf\nnan = math.nan\nstring_classes = (str, bytes)' > /opt/conda/lib/python3.8/site-packages/torch/_six.py`
 - `PYTHONPATH=. pytest atorch/tests`

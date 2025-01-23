@@ -1,10 +1,15 @@
 import logging
 import warnings
 
-import GPy
 import numpy as np
-from GPy.models import InputWarpedGP
-from GPy.util.input_warping_functions import KumarWarping
+
+try:
+    import GPy
+    from GPy.models import InputWarpedGP
+    from GPy.util.input_warping_functions import KumarWarping
+except (ImportError, ModuleNotFoundError):
+    print("Install GPy package to support auto training optimization.")
+
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 from atorch.auto.engine.sg_algo.hebo.models.base_model import BaseModel

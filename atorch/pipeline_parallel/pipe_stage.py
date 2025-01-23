@@ -1,14 +1,20 @@
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import distributed as dist
 from torch import nn
 
 from atorch.communication.pipe_communicator import PipeCommunicator
-from atorch.distributed.distributed import pipe_next_rank, pipe_prev_rank
+from atorch.utils.version import torch_version
 
 logger = logging.getLogger(__name__)
+
+_is_torch_version_smaller_than_25 = False
+if torch_version() < (2, 5, 0):  # type: ignore
+    _is_torch_version_smaller_than_25 = True
+else:
+    _is_torch_version_smaller_than_25 = False
 
 try:
     from torch.distributed.pipelining._debug import map_debug_info
@@ -35,11 +41,19 @@ class PipeStage(_PipelineStageBase):
         # TODO: allocate inputs/outputs tensors in advance
         self.pipe_communicator = PipeCommunicator()
 
-        self.prev_stage_rank = pipe_prev_rank()
-        self.next_stage_rank = pipe_next_rank()
+        def stage_global_rank(peer_rank):
+            return peer_rank if group is None else dist.get_global_rank(group, peer_rank)
+
+        self.prev_stage_rank = stage_global_rank((self.group_rank - 1) % self.group_size)
+        self.next_stage_rank = stage_global_rank((self.group_rank + 1) % self.group_size)
 
         self.fwd_received_tensors: Dict[int, List[torch.Tensor]] = {}
         self.bwd_received_grads: Dict[int, List[torch.Tensor]] = {}
+
+        # backward state
+        self.backward_state: Dict[int, Tuple[Any, ...]] = {}
+        # store dw_runner per microbatch_id
+        self.dw_runner: Dict[int, Callable[..., None]] = {}
 
     def _create_grad_recv_info(
         self,
@@ -241,12 +255,81 @@ class PipeStage(_PipelineStageBase):
                 "input_values": input_values,
             }
 
-        self.grads_input = self.backward_maybe_with_nosync(bwd_kwargs)
+        if _is_torch_version_smaller_than_25:
+            assert full_backward, "only full_backward=True is supported"
+            self.grads_input = self.backward_maybe_with_nosync(bwd_kwargs)
+        else:
+            assert self.dw_builder is None, "Not support dw builder"
+
+            # Save full_backward
+            bwd_kwargs["full_backward"] = full_backward
+
+            if full_backward:
+                self.grads_input, _ = self.backward_maybe_with_nosync("full", bwd_kwargs)
+            else:
+                # perform the partial backwards for the inputs with a custom backward function
+                # when the "stage_ouput" is a loss, then it is a tensor, otherwise it is a tuple of tensors
+                if isinstance(bwd_kwargs["stage_output"], torch.Tensor):
+                    bwd_kwargs["stage_output"] = (bwd_kwargs["stage_output"],)
+
+                self.grads_input, param_groups = self.backward_maybe_with_nosync("input", bwd_kwargs)
+
+                # TODO: we dont need to save this, add to dw_runner?
+                self.backward_state[bwd_chunk_id] = (
+                    input_values,
+                    param_groups,
+                    bwd_kwargs["stage_output"],
+                    bwd_kwargs["output_grads"],
+                )
+                # Save a placeholder for the dw_runner
+                self.dw_runner[bwd_chunk_id] = lambda: None
+
         logger.debug(f"{self.log_prefix} Backwarded chunk {bwd_chunk_id}")  # noqa: G004
 
         return self.grads_input
+
+    def backward_weight_one_chunk(self, bwd_chunk_id: int):
+        assert bwd_chunk_id in self.dw_runner, (
+            f"{self.log_prefix} Attempted to run backward_weight_one_chunk for chunk {bwd_chunk_id}"
+            " without first calling `backward_one_chunk(full_backward=False)`"
+        )
+
+        (
+            input_values,
+            param_groups,
+            stage_output,
+            output_grads,
+        ) = self.backward_state.pop(bwd_chunk_id)
+
+        if self.stage_index != 0:
+            bwd_kwargs = {
+                "stage_output": stage_output,
+                "param_groups": param_groups,
+                "full_backward": False,
+            }
+            weight_grads, _ = self.backward_maybe_with_nosync("weight", bwd_kwargs)
+        else:
+            # TODO: figure out a better way to do this:
+            # if inputs does not require gradient,
+            # then the parameter group will not be fully captured during stage_backward_input
+            # in this case, we need call grad directly on the parameters
+            # To solve: make input fn do the intersect compute and then finish it off during W
+            bwd_kwargs = {
+                "stage_output": stage_output,
+                "output_grads": output_grads,
+                "input_values": input_values,
+                "full_backward": False,
+            }
+            self.backward_maybe_with_nosync("full", bwd_kwargs)
 
     def batch_p2p(self, p2p_ops: List[torch.distributed.P2POp], desc: str):
         desc_str = f"{desc}, " if desc else ""
         logger.debug(f"batch_p2p {desc_str}{p2p_ops}")  # noqa: G004
         return self.pipe_communicator.batch_p2p(p2p_ops)
+
+    def clear_runtime_states(self):
+        super().clear_runtime_states()
+        self.fwd_received_tensors.clear()
+        self.bwd_received_grads.clear()
+
+        self.pipe_communicator.clear_recv_buffer_grad()

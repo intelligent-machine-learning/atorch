@@ -2,7 +2,11 @@ import json
 import os
 
 import deepspeed
-import fairscale
+
+try:
+    import fairscale
+except ImportError:
+    fairscale = None
 import torch
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -256,7 +260,7 @@ class ModelEngine:
                 if include_model:
                     state.update({"model_state_dict": model.state_dict()})
                 if include_optimizer_state:
-                    if isinstance(opt, fairscale.optim.oss.OSS):
+                    if fairscale is not None and isinstance(opt, fairscale.optim.oss.OSS):
                         opt.consolidate_state_dict()
                         rank = atorch.rank()
                         if rank == 0:
@@ -408,8 +412,8 @@ class ModelEngine:
         """
         unwarp model for inferencing
         """
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel) or isinstance(
-            model, fairscale.nn.data_parallel.sharded_ddp.ShardedDataParallel
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel) or (
+            fairscale is not None and isinstance(model, fairscale.nn.data_parallel.sharded_ddp.ShardedDataParallel)
         ):
             # hard code
             return model

@@ -29,7 +29,7 @@ def clip_grad_norm(model, max_norm, norm_type=2, optimizer=None, process_group_n
     Returns:
         Total norm of the parameters (viewed as a single vector) or None if using ds zero optimizer.
     """
-    if isinstance(optimizer, DeepSpeedZeroOptimizer):
+    if DeepSpeedZeroOptimizer is not None and isinstance(optimizer, DeepSpeedZeroOptimizer):
         assert norm_type == 2, "deep speed zero optimizer only supports L2 norm"
         optimizer.clip_grad = max_norm
         return None

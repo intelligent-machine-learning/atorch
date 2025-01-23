@@ -43,25 +43,46 @@ def model_transform(
     assert not strategy.is_tunable()
     record_user_defined_half_precision_dtype(strategy)
     cpu_offload = False
+    has_fsdp2 = False
+    param_init_by_user_fn_already = False
     for opt in strategy:
         opt_name = opt[0]
         opt_config = opt[1]
         model_context = opt_lib[opt_name].transform(model_context, opt_config)
         if opt_name == "fsdp" and opt_config is not None and opt_config.get("cpu_offload", False) is True:
             cpu_offload = True
+        if opt_name == "fsdp2":
+            has_fsdp2 = True
+            model_device = next(model_context.model.parameters()).device
+            if "param_init_fn" in opt_config and model_device is torch.device("cuda"):
+                param_init_by_user_fn_already = True
+
     model_context.adjust_wrappers()
     if apply_wrapper:
         model_context.apply_wrappers(is_pre_wrapper=True)
     if create_dataloader:
         model_context.update_dataloader()
-    if create_optim:
-        model_context.update_optim()
     if use_sample_batch:
         model_context.update_sample_batch()
-    if apply_wrapper:
-        model_context.apply_wrappers(is_pre_wrapper=False)
-    if torch.cuda.is_available() and not model_context.gpu_used and not cpu_offload:
-        reload_meta_module(model_context.model, torch.device(type="cuda", index=local_rank()), False)
+    if not has_fsdp2:
+        if create_optim:
+            model_context.update_optim()
+        if apply_wrapper:
+            model_context.apply_wrappers(is_pre_wrapper=False)
+
+    if (
+        torch.cuda.is_available()
+        and not model_context.gpu_used
+        and not cpu_offload
+        and not param_init_by_user_fn_already
+    ):
+        reload_meta_module(model_context.model, torch.device(type="cuda", index=local_rank()), False, True, has_fsdp2)
+
+    if has_fsdp2:
+        if create_optim:
+            model_context.update_optim()
+        if apply_wrapper:
+            model_context.apply_wrappers(is_pre_wrapper=False)
     return model_context
 
 

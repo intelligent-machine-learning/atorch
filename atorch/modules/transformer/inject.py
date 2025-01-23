@@ -137,6 +137,7 @@ def replace_module(
     need_src_module=False,
     init_from_attr=False,
     bkup_ori=False,
+    strict=True,
 ):
     r"""replace model's src_module to tgt_module.
 
@@ -154,6 +155,7 @@ def replace_module(
             Default: None. The passed may be accessed for hype-rparameters, mock
             HFace Transformers
         bkup_ori (str, optional): Default: False. Whether to backup original module
+        strict: Default: True. Whether to raise error when state dict key not match
 
     Return:
         model (nn.Module): the replaced model.
@@ -219,13 +221,19 @@ def replace_module(
                         mod_is_meta = is_meta(child)
                         if mod_is_meta:
                             reload_meta_module(child, delete_ckpt_name=False)
-                        new_module.load_state_dict(child.state_dict())
+                        new_module.load_state_dict(child.state_dict(), strict=strict)
                         if mod_is_meta:
                             recursive_empty_param(child, ignore_save=True)
                             empty_param(new_module, prefix_name="replace_")
                             recursive_empty_param(new_module, prefix_name="replace_")
                 if bkup_ori:
                     ori_module_bkup[model] = ori_module_bkup.get(model, []) + [(child_name, child)]
+                old_module_requires_grad = {}
+                for p_name, p in child.named_parameters():
+                    old_module_requires_grad[p_name] = p.requires_grad
+                for p_name, p in new_module.named_parameters():
+                    if p_name in old_module_requires_grad:
+                        p.requires_grad = old_module_requires_grad[p_name]
                 setattr(model, name, new_module)
             else:
                 _replace(child, child_name)

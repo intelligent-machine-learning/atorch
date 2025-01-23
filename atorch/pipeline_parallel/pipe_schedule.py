@@ -6,12 +6,20 @@ except (ImportError, ModuleNotFoundError):
     Schedule1F1B = object
     ScheduleInterleaved1F1B = object
 
+
 from atorch.pipeline_parallel.pipe_module import PipeModule, make_pipe_module
+from atorch.utils.version import torch_version
+
+if torch_version() >= (2, 5, 0):  # type: ignore
+    from torch.distributed.pipelining import ScheduleInterleavedZeroBubble
+else:
+    ScheduleInterleavedZeroBubble = object
 
 
 class PipeSchedulerType(Enum):
     Schedule1F1B = "Schedule1F1B"
     ScheduleInterleaved1F1B = "ScheduleInterleaved1F1B"
+    ScheduleZeroBubble = "ScheduleZeroBubble"
 
 
 def _init_pipe_schedule_from_pipe_module(pipe_module: PipeModule, sche_type, n_microbatches):
@@ -21,6 +29,10 @@ def _init_pipe_schedule_from_pipe_module(pipe_module: PipeModule, sche_type, n_m
     elif sche_type is PipeSchedulerType.ScheduleInterleaved1F1B:
         pipe_stage = pipe_module.stages
         ScheduleClass = ScheduleInterleaved1F1B
+    elif sche_type is PipeSchedulerType.ScheduleZeroBubble:
+        pipe_stage = pipe_module.stages
+        ScheduleClass = ScheduleInterleavedZeroBubble
+        print("Warning: Zero bubble still has memory leakage problem on torch2.5.0")
     else:
         raise NotImplementedError()
 

@@ -5,19 +5,34 @@ from typing import Union
 from urllib.request import urlretrieve
 
 import pytest
+from packaging import version
 
 import atorch
+from atorch.common.log_utils import default_logger as logger
 
 torch = pytest.importorskip("torch", minversion="2.0.9")
 if torch.version.git_version != "7bcf7da3a268b435777fe87c7794c382f444e86d" or not torch.cuda.is_available():
     pytest.skip("requires pytorch 2.1 stable release", allow_module_level=True)
 
-from atorch.common.log_utils import default_logger as logger  # noqa: E402
+try:
+    import ant_patches
+except ModuleNotFoundError as e:
+    print(e)
+    print(
+        "Can't import ant_patches, if you want to use megatron with version >= 'core_r0.9.0', "
+        "please use 'ant_core_r0.9.0' branch."
+    )
+    ant_patches = None
+
+
 from atorch.common.util_func import find_free_port  # noqa: E402
-from atorch.trainer import AtorchTrainerV2, AtorchTrainingArgs  # noqa: E402
+from atorch.trainer.args import AtorchTrainingArgs  # noqa: E402
+from atorch.trainer.atorch_trainer_v2 import AtorchTrainerV2  # noqa: E402
 from atorch.trainer.megatron import MegatronTrainStep  # noqa: E402
 from atorch.utils.import_util import is_coverage_available, is_megatron_lm_available  # noqa: E402
 from atorch.utils.version import torch_version  # noqa: E402
+
+assert is_megatron_lm_available(), f"Can't import megatron, PYTHONPATH={os.environ['PYTHONPATH']}"
 
 if is_megatron_lm_available():
     import megatron.legacy.model
@@ -29,6 +44,7 @@ if is_megatron_lm_available():
         get_gpt_layer_local_spec,
         get_gpt_layer_with_transformer_engine_spec,
     )
+    from megatron.core.package_info import __version__ as megatron_version
     from megatron.core.transformer.spec_utils import import_module
     from megatron.training import get_args, get_tokenizer, print_rank_0
     from megatron.training.arguments import core_transformer_config_from_args
@@ -43,12 +59,7 @@ if is_coverage_available():
     import coverage
 
 
-# torch = pytest.importorskip("torch", minversion="2.0.9")
-# if torch.version.git_version != "7bcf7da3a268b435777fe87c7794c382f444e86d" or not torch.cuda.is_available():
-#     pytest.skip("requires pytorch 2.1 stable release", allow_module_level=True)
-
-
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+def model_provider(pre_process=True, post_process=True) -> Union["GPTModel", "megatron.legacy.model.GPTModel"]:
     """Builds the model.
 
     If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
@@ -120,21 +131,50 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     def core_gpt_dataset_config_from_args(args):
         tokenizer = get_tokenizer()
 
-        return GPTDatasetConfig(
-            random_seed=args.seed,
-            sequence_length=args.seq_length,
-            blend=args.data_path,
-            blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
-            split=args.split,
-            path_to_cache=args.data_cache_path,
-            mock=args.mock_data,
-            mmap_bin_files=args.mmap_bin_files,
-            tokenizer=tokenizer,
-            reset_position_ids=args.reset_position_ids,
-            reset_attention_mask=args.reset_attention_mask,
-            eod_mask_loss=args.eod_mask_loss,
-            create_attention_mask=args.create_attention_mask_in_dataloader,
-        )
+        if version.parse(megatron_version) > version.parse("0.6.0"):
+            from megatron.core.datasets.utils import get_blend_from_list
+
+            return GPTDatasetConfig(
+                random_seed=args.seed,
+                sequence_length=args.seq_length,
+                blend=get_blend_from_list(args.data_path),
+                blend_per_split=[
+                    get_blend_from_list(args.train_data_path),
+                    get_blend_from_list(args.valid_data_path),
+                    get_blend_from_list(args.test_data_path),
+                ],
+                renormalize_blend_weights=args.renormalize_blend_weights,
+                split=args.split,
+                num_dataset_builder_threads=args.num_dataset_builder_threads,
+                path_to_cache=args.data_cache_path,
+                mmap_bin_files=args.mmap_bin_files,
+                tokenizer=tokenizer,
+                reset_position_ids=args.reset_position_ids,
+                reset_attention_mask=args.reset_attention_mask,
+                eod_mask_loss=args.eod_mask_loss,
+                create_attention_mask=args.create_attention_mask_in_dataloader,
+                s3_cache_path=args.s3_cache_path,
+            )
+        else:
+            return GPTDatasetConfig(
+                random_seed=args.seed,
+                sequence_length=args.seq_length,
+                blend=args.data_path,
+                blend_per_split=[
+                    args.train_data_path,
+                    args.valid_data_path,
+                    args.test_data_path,
+                ],
+                split=args.split,
+                path_to_cache=args.data_cache_path,
+                mock=args.mock_data,
+                mmap_bin_files=args.mmap_bin_files,
+                tokenizer=tokenizer,
+                reset_position_ids=args.reset_position_ids,
+                reset_attention_mask=args.reset_attention_mask,
+                eod_mask_loss=args.eod_mask_loss,
+                create_attention_mask=args.create_attention_mask_in_dataloader,
+            )
 
     args = get_args()
     config = core_gpt_dataset_config_from_args(args)
@@ -337,6 +377,7 @@ def run_atorch_trainer_v2():
         distributed_backend="nccl",
         use_distributed_optimizer=True,
         # Logging args
+        enable_one_logger=False,
         log_timers_to_tensorboard=True,
         log_validation_ppl_to_tensorboard=True,
         log_memory_to_tensorboard=True,
@@ -357,7 +398,6 @@ def run_atorch_trainer_v2():
         mock_data=True,
         seq_length=512,
         num_workers=0,
-        gradient_accumulation_fusion=False,
     )
 
     if megatron_args["sequence_parallel"]:

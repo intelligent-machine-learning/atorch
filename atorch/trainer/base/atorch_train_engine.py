@@ -6,13 +6,13 @@ from accelerate.state import GradientState
 from torch.utils.data import DataLoader
 from transformers.trainer_callback import TrainerState
 
+from atorch.trainer.args import AtorchTrainingArgs
 from atorch.utils.dev_utils import raise_not_impl
 
 
 class AtorchTrainEngine(torch.nn.Module):
     def __init__(self, train_args):
         super().__init__()
-        from atorch.trainer import AtorchTrainingArgs
 
         self.train_args: AtorchTrainingArgs = train_args
         self.gradient_state = GradientState()

@@ -52,7 +52,7 @@ class MultiwayNetwork(nn.Module):
         self.B = copy.deepcopy(module)
         self.B.reset_parameters()
         self.split_position = -1
-        self.p = nn.Parameter(torch.tensor(1.0))
+        self.p = nn.Parameter(torch.tensor([1.0]))
 
     def forward(self, x, **kwargs):
         if self.split_position == -1:
@@ -108,7 +108,7 @@ class MyModel(nn.Module):
         self.ln = nn.LayerNorm(dim)
         self.layers = HoldModule([self.ffn, self.ffn2])
         init_scale = math.sqrt(math.log(nlayers * 2))
-        self.p = nn.Parameter(torch.tensor(1.0))
+        self.p = nn.Parameter(torch.tensor([1.0]))
         for name, p in self.named_parameters():
             if "bias" in name:
                 p.data.zero_()

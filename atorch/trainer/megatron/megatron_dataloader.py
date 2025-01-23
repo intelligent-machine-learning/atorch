@@ -1,6 +1,7 @@
-from typing import Iterator, List, Union
+from typing import Callable, Iterator, List, Union
 
 import torch
+from torch.utils.data import DataLoader
 
 from atorch.common.log_utils import default_logger as logger
 from atorch.trainer.base.dataloader import AtorchDataloader
@@ -10,6 +11,11 @@ if is_megatron_lm_available():
     from megatron.core import mpu
     from megatron.training import get_args
     from megatron.training.training import build_train_valid_test_data_iterators
+
+    try:
+        from megatron.training import get_num_microbatches
+    except ImportError:
+        from megatron.core.num_microbatches_calculator import get_num_microbatches
 
 _PYTORCH_DATALOADER_KWARGS = {  # default dataloader args
     "batch_size": 1,
@@ -197,7 +203,7 @@ def _prepare_megaton_dataloader(train_args, dataloaders):
     batch_data = None
 
     for dataloader in dataloaders:
-        if isinstance(dataloader, torch.utils.data.DataLoader) and batch_data is None:
+        if isinstance(dataloader, DataLoader) and batch_data is None:
             batch_data = next(iter(dataloader))
 
     torch.distributed.barrier()
@@ -205,7 +211,7 @@ def _prepare_megaton_dataloader(train_args, dataloaders):
     counter = 0
     result = []
     for dataloader in dataloaders:
-        if isinstance(dataloader, torch.utils.data.DataLoader):
+        if isinstance(dataloader, DataLoader):
             result.append(prepare_data_loader(train_args, dataloader))
             counter += 1
         elif isinstance(dataloader, AtorchMegatronDataloader):
@@ -237,7 +243,7 @@ def _prepare_torch_dataloader(dataloader, train_args):  # TODO: add : AtorchTrai
             del kwargs["batch_sampler"]
             kwargs["batch_size"] = micro_batch_size
 
-        dataloader = torch.utils.data.DataLoader(dataloader.dataset, **kwargs)
+        dataloader = DataLoader(dataloader.dataset, **kwargs)
         # split_batches:
         # Megatron only needs to fetch different data between different dp groups,
         # and does not need to split the data within the dp group.
@@ -346,7 +352,7 @@ def _handle_megatron_empty_data_iterator(train_args, data_iterator):
     return data_iterator
 
 
-def wrap_megatron_dataloader(data_iterator: Union[Iterator, List[Iterator]]):
+def wrap_megatron_dataloader(data_iterator: Union[Iterator, List[Iterator], DataLoader, List[DataLoader]], is_finetune):
     """
     Args:
         data_iterator:
@@ -354,7 +360,13 @@ def wrap_megatron_dataloader(data_iterator: Union[Iterator, List[Iterator]]):
 
     """
 
+    args = get_args()
+
     class MegatronIteratorWrapper:
+        """
+        MegatronIteratorWrapper is used in pretrain, just one epoch.
+        """
+
         def __init__(
             self,
             data_iterator: Union[Iterator, List[Iterator]],
@@ -367,4 +379,155 @@ def wrap_megatron_dataloader(data_iterator: Union[Iterator, List[Iterator]]):
         def __next__(self):
             return self.data_iterator
 
-    return MegatronIteratorWrapper(data_iterator)
+    class MegatronDataloaderWrapper:
+        """
+        MegatronDataloaderWrapper is used in finetune scene, supporting multi-epochs.
+        """
+
+        def __init__(
+            self,
+            dataloader: Union[DataLoader, List[DataLoader]],
+        ) -> None:
+            self.dataloader = dataloader
+
+            # The follow three size info will be set to the value on model_parallel rank 0
+            # via broadcast in model_parallel group.
+            self.dataloader_length = 0
+            self.dataloader_batch_size = 0
+            self.dataset_length = 0
+
+            # The follow attributes are None if self.dataloader is None.
+            self.dataset = None
+            self.sampler = None
+
+            if args.virtual_pipeline_model_parallel_size is not None:
+                assert isinstance(self.dataloader, list), "VPP requires dataloader to be a list."
+                batch_size = 0
+                dataloader_length = 0
+                dataset_length = 0
+                for d in self.dataloader:
+                    if d is not None:
+                        assert hasattr(d, "batch_size"), "dataloader must has batch_size attribute."
+                        assert hasattr(d, "dataset"), "dataloader must has dataset attribute."
+                        assert hasattr(d, "sampler"), "dataloader must has sampler attribute."
+                        batch_size = d.batch_size
+                        self.dataset = d.dataset
+                        self.sampler = d.sampler
+                        dataloader_length = len(d)
+                        dataset_length = len(self.dataset)
+
+                size_info = torch.tensor(
+                    [dataloader_length, dataset_length, batch_size],
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                )
+                # assert: dataloader on model_parallel_rank 0 must be a real dataloader instance, not be None.
+                model_parallel_src_rank = torch.distributed.get_process_group_ranks(
+                    group=mpu.get_model_parallel_group()
+                )[0]
+                torch.distributed.broadcast(size_info, model_parallel_src_rank, group=mpu.get_model_parallel_group())
+
+                self.dataloader_length = size_info[0].item()
+                self.dataset_length = size_info[1].item()
+                self.dataloader_batch_size = size_info[2].item()
+            else:
+                dataloader_length = 0
+                dataset_length = 0
+                batch_size = 0
+                if self.dataloader is not None:
+                    assert hasattr(self.dataloader, "batch_size"), "dataloader must has batch_size attribute."
+                    assert hasattr(self.dataloader, "dataset"), "dataloader must has dataset attribute."
+                    assert hasattr(self.dataloader, "sampler"), "dataloader must has sampler attribute."
+                    batch_size = self.dataloader.batch_size  # type: ignore[union-attr]
+                    self.dataset = self.dataloader.dataset  # type: ignore[union-attr]
+                    self.sampler = self.dataloader.sampler  # type: ignore[union-attr]
+                    dataloader_length = len(self.dataloader)
+                    dataset_length = len(self.dataset)
+
+                size_info = torch.tensor(
+                    [dataloader_length, dataset_length, batch_size],
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                )
+                # assert: dataloader on model_parallel_rank 0 must not be None.
+                model_parallel_src_rank = torch.distributed.get_process_group_ranks(
+                    group=mpu.get_model_parallel_group()
+                )[0]
+                torch.distributed.broadcast(size_info, model_parallel_src_rank, group=mpu.get_model_parallel_group())
+
+                self.dataloader_length = size_info[0].item()
+                self.dataset_length = size_info[1].item()
+                self.dataloader_batch_size = size_info[2].item()
+
+            # Check batch_size in dataloader
+            assert (
+                self.dataloader_batch_size == args.micro_batch_size
+            ), "dataloader's batch_size should be micro_batch_size when using Megatron."
+
+            self.num_update_steps_per_epoch = self.dataloader_length // get_num_microbatches()
+
+            self._reset()
+
+        def _reset(self):
+            self._num_yielded = 0
+            if isinstance(self.dataloader, list):
+                self._dataloader_iter = [iter(d) if d is not None else None for d in self.dataloader]
+            else:
+                self._dataloader_iter = iter(self.dataloader) if self.dataloader is not None else None
+
+        def __iter__(self):
+            self._reset()
+            return self
+
+        def __next__(self):
+            if self._num_yielded < self.num_update_steps_per_epoch:
+                self._num_yielded += 1
+                return self._dataloader_iter
+            else:
+                raise StopIteration
+
+        def __len__(self):
+            return self.num_update_steps_per_epoch
+
+        def set_epoch(self, epoch):
+            """
+            Call self.sampler.set_epoch() if it is not None, only used in finetune scene.
+            """
+
+            if self.sampler is not None:
+                assert hasattr(self.sampler, "set_epoch") and isinstance(
+                    self.sampler.set_epoch, Callable
+                ), "dataloader's sampler should have set_epoch() method when finetune."
+                logger.info(f"Calling set_epoch({epoch})")
+                self.sampler.set_epoch(epoch)
+
+        @property
+        def num_examples(self):
+            """
+            Return the num of examples in dataset. self.dataset_length is valid on each rank,
+            because it received correct value from model parallel rank 0 via broadcasting.
+            """
+            return self.dataset_length
+
+    def _check_dataloader_type(dataloader, dataloader_type, pre_info):
+        if isinstance(dataloader, list):
+            for d in dataloader:
+                if d is not None:
+                    assert isinstance(
+                        d, dataloader_type
+                    ), f"In {pre_info}, the dataloader instance must be {dataloader_type} type, but got {type(d)} type."
+        elif dataloader is not None:
+            assert isinstance(
+                dataloader, dataloader_type
+            ), f"In {pre_info}, the dataloader instance must be {dataloader_type} type, but got {type(dataloader)} type."  # noqa: E501
+
+    if is_finetune:
+        # torch.util.data.Dataloader type is required for dataloader object in finetune scene.
+        _check_dataloader_type(data_iterator, DataLoader, "finetune")
+
+        return MegatronDataloaderWrapper(data_iterator)
+    else:
+        # Iterator type is required for dataloader object in pretrain.
+        _check_dataloader_type(data_iterator, Iterator, "pretrain")
+
+        return MegatronIteratorWrapper(data_iterator)

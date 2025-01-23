@@ -1,0 +1,105 @@
+## training args
+output_dir: !ENV ${OUTPUT_DIR}
+overwrite_output_dir: True
+# resume_from_checkpoint: !ENV ${OUTPUT_DIR}
+# flash_checkpoint: True
+do_train: True
+do_eval: True
+distributed_type: "megatron"
+num_train_epochs: 6
+block_size: 512
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 2
+preprocessing_num_workers: 6
+learning_rate: 2.0e-5
+weight_decay: 0.0
+warmup_ratio: 0.03
+seed: 42
+max_grad_norm: 0
+bf16: True
+save_strategy: "steps"
+save_steps: 1000
+save_total_limit: 3
+evaluation_strategy: "steps"
+eval_steps: 2000
+logging_strategy: "steps"
+logging_steps: 1
+logging_nan_inf_filter: False
+# log_params_std: True
+# log_grad_diff_for_debug: True
+tensorboard_dir: !ENV ${OUTPUT_DIR}/runs/${TIME_STAMP}
+dataloader_num_workers: 0
+gradient_checkpointing: True
+
+## data args
+data_path: &data_path /hetero_infer/jinshi.cl/code/Megatron-LM-core_r0.6.0/wikitext-2-raw-v1-llama2/llama2_tokenized_train_text_document
+tokenizer_model: &tokenizer_model /hetero_infer/jinshi.cl/code/tokenizers/llama_tokenizer/tokenizer.model
+
+## profiling args
+# profiler_type: nv
+# profiler_file_path: !ENV ${OUTPUT_DIR}/profiler_output
+# profiler_schedule_wait: 1
+# profiler_schedule_warmup: 1
+# profiler_schedule_active: 1
+# profiler_schedule_repeat: 1
+# profiler_schedule_skip_first: 20
+
+extra_configs:
+  model_type_name: "llama"
+  num_layers: 32
+  hidden_size: 4096
+  ffn_hidden_size: 11008
+  num_attention_heads: 32
+  group_query_attention: True
+  num_query_groups: 32
+  max_position_embeddings: 4096
+  position_embedding_type: "rope"
+  make_vocab_size_divisible_by: 1
+  norm_epsilon: 1.0e-5
+  normalization: "RMSNorm"
+  swiglu: True
+  untie_embeddings_and_output_weights: True
+  use_flash_attn: True
+  tokenizer_type: "Llama2Tokenizer"
+  tokenizer_model: *tokenizer_model
+  optimizer: "adam"
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  weight_decay: 1.0e-1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  pretraining_flag: False
+  use_mcore_models: True
+  transformer_impl: "transformer_engine"
+  micro_batch_size: 2
+  global_batch_size: 16
+  add_bias_linear: False
+  bias_gelu_fusion: False
+  recompute_activations: True
+  recompute_granularity: "selective"
+  train_iters: 10000
+  eval_iters: 50
+  tensor_model_parallel_size: 2
+  pipeline_model_parallel_size: 2
+  sequence_parallel: True
+  distributed_backend: "nccl"
+  enable_one_logger: False
+  use_distributed_optimizer: False
+  log_timers_to_tensorboard: True
+  log_validation_ppl_to_tensorboard: True
+  log_memory_to_tensorboard: True
+  log_throughput: True
+  log_params_norm: True
+  seed: 1403
+  init_method_std: 0.02
+  lr: 3.0e-5
+  min_lr: 3.0e-6
+  lr_ecay_style: "cosine"
+  lr_warmup_fraction: 0.1
+  data_path: [*data_path]
+  split: "949,50,1"
+  data_cache_path: !ENV ${OUTPUT_DIR}/data_cache
+  seq_length: 4096
+  num_workers: 0
