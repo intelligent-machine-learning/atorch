@@ -1,9 +1,10 @@
 <h1 align="center"><b>EDiT</b></h1>
 <h3 align="center"><b>EDiT: A Local-SGD-Based Efficient Distributed Training Method for Large Language Models</b></h3>
 
+[![ICLR](https://img.shields.io/badge/ICLR-2025-blue)](https://arxiv.org/abs/2412.07210)
 [![arXiv](https://img.shields.io/badge/arXiv-2412.07210-b31b1b.svg)](https://arxiv.org/abs/2412.07210)
 
-We present PyTorch code for [EDiT: A Local-SGD-Based Efficient Distributed Training Method for Large Language Models](https://arxiv.org/abs/2412.07210).
+We present PyTorch code for [EDiT: A Local-SGD-Based Efficient Distributed Training Method for Large Language Models](https://arxiv.org/abs/2412.07210), ICLR'25.
 
 # Introduction
 
