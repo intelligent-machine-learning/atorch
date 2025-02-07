@@ -1,9 +1,10 @@
 <h1 align="center"><b>EDiT</b></h1>
 <h3 align="center"><b>EDiT: A Local-SGD-Based Efficient Distributed Training Method for Large Language Models</b></h3>
 
+[![ICLR](https://img.shields.io/badge/ICLR-2025-blue)](https://arxiv.org/abs/2412.07210)
 [![arXiv](https://img.shields.io/badge/arXiv-2412.07210-b31b1b.svg)](https://arxiv.org/abs/2412.07210)
 
-We present PyTorch code for [EDiT: A Local-SGD-Based Efficient Distributed Training Method for Large Language Models](https://arxiv.org/abs/2412.07210).
+We present PyTorch code for [EDiT: A Local-SGD-Based Efficient Distributed Training Method for Large Language Models](https://arxiv.org/abs/2412.07210), ICLR'25.
 
 # Introduction
 
@@ -262,7 +263,7 @@ python -m atorch.distributed.run --nproc_per_node 8 train.py \
 --outer_optim_class sgd
 ```
 
-## 3D (Megatron-LM) Integratopm
+## 3D (Megatron-LM) Integration
 EDiT can also be integrated with 3D training through megatron. In atorch, we provide such functionality through patches and ATorchTrainerV2.
 
 ATorchTrainerV2 handles model construction and argument handling. To enable EDiT, we need to inject several special arguments to trainer's input arguments, and before everything, patch the megatron.
