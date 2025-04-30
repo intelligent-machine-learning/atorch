@@ -29,3 +29,6 @@ class EnvSetting(metaclass=SingletonMeta):
     DEBUG = parse_bool_env("ATORCH_DEBUG", "False")
     FORCE_FSDP2_RESHARD_AFTER_FORWARD = parse_bool_env("FORCE_FSDP2_RESHARD_AFTER_FORWARD", "False")
     CLOSE_FSDP2_BACKWARD_PREFETCH = parse_bool_env("CLOSE_FSDP2_BACKWARD_PREFETCH", "False")
+
+    # FP8
+    FORCE_QUANTIZE_PER_MICROBATCH = parse_bool_env("FORCE_QUANTIZE_PER_MICROBATCH", "False")

@@ -221,6 +221,7 @@ def run_gpt2_with_strategy(
                 },
                 f"{ckpt_path}/origin_state.pt",
             )
+        torch.distributed.barrier()
     atorch.reset_distributed()
 
 

@@ -422,8 +422,12 @@ def move_optimizer_state(optimizer, device="cpu"):
 
 def set_inter_fsdp_state(fsdp2_model, outer_cls, inter_cls):
     assert torch_version() >= (2, 5, 0)  # type: ignore
-    from torch.distributed._composable.fsdp._fsdp_state import _get_module_fsdp_state
-    from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+    try:
+        from torch.distributed._composable.fsdp._fsdp_state import _get_module_fsdp_state
+        from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+    except (ImportError, ModuleNotFoundError):
+        from torch.distributed.fsdp._fully_shard import FSDPModule
+        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 
     if not isinstance(fsdp2_model, list):
         fsdp2_model = [fsdp2_model]
@@ -449,6 +453,52 @@ def set_inter_fsdp_state(fsdp2_model, outer_cls, inter_cls):
             groupped_gemm_fsdp_state = _get_module_fsdp_state(inter_modules[i])
             setattr(groupped_gemm_fsdp_state, "_is_inter_state", True)
             setattr(llama_decoder_layer_fsdp_state, "_inter_state", groupped_gemm_fsdp_state)
+
+
+def _set_moe_forward_prefetch_for_fsdp2_ep(fsdp2_model, outer_cls, inter_cls, outermost_cls):
+    assert torch_version() >= (2, 5, 0)  # type: ignore
+    try:
+        from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+    except (ImportError, ModuleNotFoundError):
+        from torch.distributed.fsdp._fully_shard import FSDPModule
+
+    if not isinstance(fsdp2_model, list):
+        fsdp2_model = [fsdp2_model]
+
+    for single_fsdp2_model in fsdp2_model:
+        outer_modules = []
+        names1 = []
+        inter_modules = []
+        names2 = []
+        outermost_modules = []
+        names3 = []
+
+        for name, named_module in single_fsdp2_model.named_modules():
+            if isinstance(named_module, FSDPModule) and isinstance(named_module, outer_cls):
+                outer_modules.append(named_module)
+                names1.append(name)
+
+            if isinstance(named_module, FSDPModule) and isinstance(named_module, inter_cls):
+                inter_modules.append(named_module)
+                names2.append(name)
+
+            if isinstance(named_module, FSDPModule) and isinstance(named_module, outermost_cls):
+                outermost_modules.append(named_module)
+                names3.append(name)
+
+        assert len(outermost_modules) == 1
+        assert len(inter_modules) == len(outer_modules)
+        outermost_and_inter_modules = outermost_modules + inter_modules
+
+        for i in range(len(outer_modules)):
+            module1 = outermost_and_inter_modules[i]
+            module2 = outer_modules[i]
+            module1.set_modules_to_forward_prefetch([module2])
+
+        for i in range(len(outer_modules)):
+            module1 = outer_modules[i]
+            module2 = inter_modules[i]
+            module1.set_modules_to_forward_prefetch([module2])
 
 
 @_no_grad

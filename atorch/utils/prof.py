@@ -42,8 +42,6 @@ class AProfiler(object):
         self.timeline_handler = None
         self.timeline_enabled = False
         self.export_report = False
-        if not torch.cuda.is_available():
-            raise SystemError("Cannot use AProfiler without CUDA.")
 
     def start_profile(self, ignore_list=None, enable_timeline=False, distributed=False, timeline_only=False, **kwargs):
         """Starts profiling.
@@ -71,10 +69,11 @@ class AProfiler(object):
             def pre_forward_hook(module, input):
                 GlobalContext.module_flop_count.append([])
                 GlobalContext.module_mac_count.append([])
-                module.__start_event = torch.cuda.Event(enable_timing=True)
-                module.__end_event = torch.cuda.Event(enable_timing=True)
-                module.__start_event.record()
-                module.__memory_before__ = torch.cuda.memory_allocated()
+                if torch.cuda.is_available():
+                    module.__start_event = torch.cuda.Event(enable_timing=True)
+                    module.__end_event = torch.cuda.Event(enable_timing=True)
+                    module.__start_event.record()
+                    module.__memory_before__ = torch.cuda.memory_allocated()
 
             module.__pre_forward_hook_handle__ = module.register_forward_pre_hook(pre_forward_hook)
 
@@ -84,10 +83,11 @@ class AProfiler(object):
                     GlobalContext.module_mac_count.pop()
                     module.__flops__ += sum([elem[1] for elem in GlobalContext.module_flop_count[-1]])
                     GlobalContext.module_flop_count.pop()
-                module.__end_event.record()
-                torch.cuda.synchronize()
-                module.__duration__ = module.__start_event.elapsed_time(module.__end_event) / 1000
-                module.__activation__ = torch.cuda.memory_allocated() - module.__memory_before__
+                if torch.cuda.is_available():
+                    module.__end_event.record()
+                    torch.cuda.synchronize()
+                    module.__duration__ = module.__start_event.elapsed_time(module.__end_event) / 1000
+                    module.__activation__ = torch.cuda.memory_allocated() - module.__memory_before__
 
             module.__post_forward_hook_handle__ = module.register_forward_hook(post_forward_hook)
 

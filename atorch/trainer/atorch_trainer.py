@@ -44,7 +44,8 @@ from atorch.auto.strategy import Strategy
 from atorch.common.log_utils import default_logger as logger
 from atorch.distributed.distributed import is_distributed
 from atorch.trainer.atorch_args import AtorchArguments
-from atorch.trainer.trainer_callback import FlowCallback
+from atorch.trainer.event_util import get_event_callback
+from atorch.trainer.trainer_callback import AtorchCallbackHandler, FlowCallback
 from atorch.utils.fsdp_init_util import FSDPCkptConfig, FSDPInitFn
 from atorch.utils.fsdp_save_util import (
     ShardOptim,
@@ -67,7 +68,6 @@ from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer import OPTIMIZER_NAME, SCALER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME, TRAINING_ARGS_NAME
 from transformers.trainer_callback import (
-    CallbackHandler,
     PrinterCallback,
     ProgressCallback,
     TrainerCallback,
@@ -225,9 +225,15 @@ class AtorchTrainer:
         # Add additional tensorboard callback.
         if additional_tensorboard_hook is not None and len(additional_tensorboard_hook) > 0:
             report_callbacks.append(additional_tensorboard_hook[0])
+
+        # Add event export callback
+        event_callback = get_event_callback(self.__class__.__name__)
+        if event_callback is not None:
+            report_callbacks.append(event_callback)
+
         default_callbacks = DEFAULT_CALLBACKS + report_callbacks
         callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        self.callback_handler = CallbackHandler(
+        self.callback_handler = AtorchCallbackHandler(
             callbacks, self.model, self.tokenizer, self.optimizer, self.lr_scheduler
         )
         self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
@@ -319,7 +325,7 @@ class AtorchTrainer:
         self._train_batch_size = self.args.train_batch_size
 
         # Activate gradient checkpointing if needed
-        if args.gradient_checkpointing and args.atorch_checkpoint_cls is None:
+        if args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
         # Resume from checkpoint
@@ -1141,6 +1147,7 @@ class AtorchTrainer:
                 self.lr_scheduler.step(metrics[metric_to_check])
 
         if self.control.should_save:
+            self.control = self.callback_handler.on_save_begin(self.args, self.state, self.control)
             # Save model checkpoint
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             if (
@@ -1974,6 +1981,7 @@ class AtorchTrainer:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
         """
+        self.control = self.callback_handler.on_evaluate_begin(self.args, self.state, self.control)
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
         start_time = time.time()
 
@@ -2039,6 +2047,7 @@ class AtorchTrainer:
               labels).
         """
 
+        self.control = self.callback_handler.on_predict_begin(self.args, self.state, self.control)
         test_dataloader = self.get_test_dataloader(test_dataset)
         start_time = time.time()
 

@@ -50,24 +50,32 @@ def _patch_te_linear_backward(enable=True):
 class _Fp8_Cast(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor, fp8_dtype, margin):
-        if fp8_dtype == tex.DType.kFloat8E4M3:
-            fp8_max = Format.E4M3.value.max_fwd
+
+        if hasattr(tex, "cast_to_fp8"):
+            if fp8_dtype == tex.DType.kFloat8E4M3:
+                fp8_max = Format.E4M3.value.max_fwd
+            else:
+                fp8_max = Format.E5M2.value.max_fwd
+
+            amax = tensor.abs().max().float()
+            one = torch.ones(1, device="cuda")
+
+            scale = _default_sf_compute(amax, one, fp8_max, margin)
+            scale_inv = 1.0 / scale
+
+            fp8_tensor = tex.cast_to_fp8(tensor, scale, amax, scale_inv, fp8_dtype)
+            fp8_tensor = Float8Tensor(
+                data=fp8_tensor,
+                fp8_dtype=fp8_dtype,
+                fp8_scale_inv=scale_inv,
+                dtype=tensor.dtype,
+            )
         else:
-            fp8_max = Format.E5M2.value.max_fwd
+            from transformer_engine.pytorch.tensor.float8_tensor import Float8CurrentScalingQuantizer
 
-        amax = tensor.abs().max().float()
-        one = torch.ones(1, device="cuda")
+            quantizer = Float8CurrentScalingQuantizer(fp8_dtype, device=tensor.device, amax_epsilon=margin)
+            fp8_tensor = quantizer(tensor)
 
-        scale = _default_sf_compute(amax, one, fp8_max, margin)
-        scale_inv = 1.0 / scale
-
-        fp8_tensor = tex.cast_to_fp8(tensor, scale, amax, scale_inv, fp8_dtype)
-        fp8_tensor = Float8Tensor(
-            data=fp8_tensor,
-            fp8_dtype=fp8_dtype,
-            fp8_scale_inv=scale_inv,
-            dtype=tensor.dtype,
-        )
         fp8_tensor.requires_grad = tensor.requires_grad
         return fp8_tensor
 
@@ -214,7 +222,7 @@ class PrecisionSwitchableLinear(torch.nn.Module):
     def set_extra_state(self, state) -> None:
         assert isinstance(state, io.BytesIO)
         state.seek(0)
-        state = torch.load(state)
+        state = torch.load(state, weights_only=False)
 
         self.selection = state["selection"]
         self._precision_modules[LinearPrecision.FP8].set_extra_state(state["fp8_extra_state"])

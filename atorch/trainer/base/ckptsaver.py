@@ -13,5 +13,5 @@ class CkptSaver(ABC, TrainerCallback):
         pass
 
     @abstractmethod
-    def get_interation_path(self, output_dir: str, iteration: int, **kwargs):
+    def get_interation_path(self, output_dir: str, iteration: int, **kwargs) -> str:
         pass

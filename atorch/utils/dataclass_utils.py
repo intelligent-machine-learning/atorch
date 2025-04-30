@@ -25,6 +25,14 @@ def clear_environment():
         os.environ.update(_old_os_env_backups)
 
 
+def is_json_serializable(obj):
+    try:
+        json.dumps(obj)
+        return True
+    except (TypeError, OverflowError):
+        return False
+
+
 class DataclassMixin:
     """
     provide a default to_dict and to_kwargs helper functions for dataclass
@@ -43,25 +51,32 @@ class DataclassMixin:
         """
 
         def serialize_dict(d: dict):
+            args_to_dict = {}
             for k, v in d.items():
                 if isinstance(v, Callable):  # type: ignore[arg-type]
-                    d[k] = v.__name__ if hasattr(v, "__name__") else str(v)
+                    args_to_dict[k] = v.__name__ if hasattr(v, "__name__") else str(v)
                 elif isinstance(v, (list, tuple)) and len(v) > 0:
                     if isinstance(v[0], Enum):
-                        d[k] = [x.value for x in v]
+                        args_to_dict[k] = [x.value for x in v]
                         if isinstance(v, tuple):
-                            d[k] = tuple(d[k])
+                            args_to_dict[k] = tuple(d[k])
                     elif isinstance(v[0], Callable):  # type: ignore[arg-type]
-                        d[k] = [x.__name__ if hasattr(x, "__name__") else str(x) for x in v]
+                        args_to_dict[k] = [x.__name__ if hasattr(x, "__name__") else str(x) for x in v]
                         if isinstance(v, tuple):
-                            d[k] = tuple(d[k])
+                            args_to_dict[k] = tuple(d[k])
                 elif isinstance(v, dict):
-                    d[k] = serialize_dict(v)
-            return d
+                    args_to_dict[k] = serialize_dict(v)
+                else:
+                    if is_json_serializable(v):
+                        args_to_dict[k] = v
+                    elif hasattr(v, "__name__"):
+                        args_to_dict[k] = v.__name__
+                    else:
+                        args_to_dict[k] = str(v)
+
+            return args_to_dict
 
         d = {field.name: getattr(self, field.name) for field in fields(self) if field.init}
-
-        d = copy.deepcopy(d)
 
         return serialize_dict(d)
 
@@ -94,7 +109,7 @@ class AutoMapperExtraConfigs:
         if overwrite_extra_configs:
             target_dict = self.extra_configs
         else:
-            target_dict = copy.deepcopy(self.extra_configs)
+            target_dict = copy.copy(self.extra_configs)
 
         # Compat megatron args and atorch args
         # If there is an argument named A in Megatron and an argument named B in atorch,

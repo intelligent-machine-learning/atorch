@@ -1,4 +1,3 @@
-import dataclasses
 import gc
 import json
 import math
@@ -7,6 +6,7 @@ import random
 import sys
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -25,14 +25,7 @@ from transformers.integrations import TensorBoardCallback
 # isort: on
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.trainer import TRAINER_STATE_NAME
-from transformers.trainer_callback import (
-    CallbackHandler,
-    PrinterCallback,
-    ProgressCallback,
-    TrainerCallback,
-    TrainerControl,
-)
+from transformers.trainer_callback import PrinterCallback, ProgressCallback, TrainerCallback
 from transformers.trainer_pt_utils import IterableDatasetShard, distributed_concat
 from transformers.trainer_utils import TrainOutput, has_length, speed_metrics
 
@@ -40,14 +33,21 @@ from atorch.common.log_utils import default_logger as logger
 from atorch.distributed.distributed import is_distributed
 from atorch.trainer.args import AtorchTrainingArgs
 from atorch.trainer.atorch_profiler import get_profiler
+from atorch.trainer.base.atorch_container import AtorchTrainerContainer
 from atorch.trainer.base.atorch_module import AtorchIRModel
 from atorch.trainer.base.atorch_train_engine import AtorchTrainEngine
 from atorch.trainer.base.dataset import AtorchDataset
-from atorch.trainer.trainer_callback import AtorchTrainerState, FlowCallbackV2
+from atorch.trainer.event_util import get_event_callback
+from atorch.trainer.trainer_callback import (
+    AtorchCallbackHandler,
+    AtorchTrainerControl,
+    AtorchTrainerState,
+    FlowCallbackV2,
+    PredictCallback,
+)
 from atorch.trainer.utils import DistributedType, print_all_args_before_training
 from atorch.utils.hooks import ATorchHooks
 from atorch.utils.import_util import is_megatron_lm_available, is_torch_npu_available
-from atorch.utils.version import package_version_bigger_than
 
 if is_megatron_lm_available():
     from megatron.training.global_vars import get_args, get_timers
@@ -65,6 +65,9 @@ DEFAULT_FLOW_CALLBACKS = [FlowCallbackV2]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
 
 additional_tensorboard_hook = ATorchHooks.hooks.get(ATorchHooks.ADDITIONAL_TENSORBOARD_HOOK)
+
+
+# TRAINER_CONTAINER: AtorchTrainerContainer = None
 
 
 def count_model_params(model):
@@ -137,23 +140,36 @@ class AtorchTrainerV2:
         report_callbacks = []
         if self.distributed_type != DistributedType.MEGATRON:
             report_callbacks.append(TensorBoardCallback)
-        # Add additional tensorboard callback.
-        if additional_tensorboard_hook is not None and len(additional_tensorboard_hook) > 0:
-            report_callbacks.append(additional_tensorboard_hook[0])
+            # Add additional tensorboard callback.
+            if additional_tensorboard_hook is not None and len(additional_tensorboard_hook) > 0:
+                report_callbacks.append(additional_tensorboard_hook[0])
+
+        # Add event export callback
+        event_callback = get_event_callback(self.__class__.__name__)
+        if event_callback is not None:
+            report_callbacks.append(event_callback)
+
         default_callbacks = DEFAULT_FLOW_CALLBACKS + report_callbacks
+
+        atorch_trainer_container, container_callbacks = AtorchTrainerContainer.create(self.args)
+        default_callbacks = default_callbacks + container_callbacks
+
         callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        self.callback_handler = CallbackHandler(
+        self.callback_handler = AtorchCallbackHandler(
             callbacks, self.model, self.tokenizer, self.optimizer, self.lr_scheduler
         )
-        if self.distributed_type != DistributedType.MEGATRON:
+        if self.distributed_type == DistributedType.MEGATRON:
+            self.add_callback(PredictCallback)
+        else:
             self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
         self.state = AtorchTrainerState(
             is_local_process_zero=self.args.is_local_main_process,
             is_world_process_zero=self.args.is_main_process,
+            epoch=0,
         )
 
-        self.control = TrainerControl()
+        self.control = AtorchTrainerControl()
 
         # Ensure this is called at the end of __init__()
         self.control = self.callback_handler.on_init_end(self.args, self.state, self.control)
@@ -205,16 +221,13 @@ class AtorchTrainerV2:
         resume_from_checkpoint_arg_in_kwargs = kwargs.get("resume_from_checkpoint", None)
         if resume_from_checkpoint_arg_in_kwargs is not None:
             logger.warning(
-                "'resume_from_checkpoint' pass by train function is deprecated and will have NO effect, "
+                "'resume_from_checkpoint' pass by train function is deprecated and have NO effect now, "
                 "please set it in training args."
             )
 
         resume_from_checkpoint = self.args.resume_from_checkpoint
-        extra_dict = {}
 
-        return self._inner_training_loop(
-            args=self.args, resume_from_checkpoint=resume_from_checkpoint, ais_saved_extra_dict=extra_dict
-        )
+        return self._inner_training_loop(args=self.args, resume_from_checkpoint=resume_from_checkpoint)
 
     def _inner_training_loop(self, args: AtorchTrainingArgs, resume_from_checkpoint=None, **kwargs):
         if self.datasets is not None:
@@ -278,6 +291,7 @@ class AtorchTrainerV2:
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.lr_scheduler,
+                train_state=self.state,
                 dataloaders=dataloaders,
                 resume_from_checkpoint=resume_from_checkpoint,
                 **kwargs,
@@ -285,6 +299,17 @@ class AtorchTrainerV2:
             megatron_args = get_args()
         else:
             raise NotImplementedError(f"Not implemented distributed backend {self.distributed_type}.")
+
+        try:
+            from ant_utils.dcp_utils.dcp_utils import patch_torch
+
+            patch_torch(patch_find_nd_overlapping_shards=self.args.patch_find_nd_overlapping_shards)
+        except ImportError:
+            logger.warning(
+                "Unable to import patch_torch from ant_utils.dcp_utils.dcp_utils, you might not using "
+                "available megatron version. If you want to use a speedup version of megatron,"
+                "please read atorch doc to use a proper megatron version."
+            )
 
         train_dataloader = self.train_engine.get_dataloader("train")
 
@@ -367,11 +392,11 @@ class AtorchTrainerV2:
             args.save_steps = math.ceil(max_steps * args.save_steps)
 
         # Not support search hyper param
-        self.state.is_hyper_param_search = False
-        if package_version_bigger_than("transformers", "4.31.0"):
-            self.state.logging_steps = args.logging_steps
-            self.state.eval_steps = args.eval_steps
-            self.state.save_steps = args.save_steps
+        # self.state.is_hyper_param_search = False
+        # if package_version_bigger_than("transformers", "4.31.0"):
+        #     self.state.logging_steps = args.logging_steps
+        #     self.state.eval_steps = args.eval_steps
+        #     self.state.save_steps = args.save_steps
 
         # Train!
         logger.info("***** Running training *****")
@@ -398,28 +423,6 @@ class AtorchTrainerV2:
 
         # these resuming logic should be somehow moved to engines
         if resume_from_checkpoint is not None and not is_finetune:
-            ais_saved_extra_dict = kwargs.get("ais_saved_extra_dict", None)
-
-            if ais_saved_extra_dict:
-                trainer_state_dict = ais_saved_extra_dict.get("trainer_state", None)
-                if trainer_state_dict is None:
-                    raise ValueError("not able to load trainer state from ais, please check with ais supporter")
-                self.state = AtorchTrainerState(**trainer_state_dict)
-                custom_dict = ais_saved_extra_dict.get("customize_dict", None)
-                if args.distributed_type == "megatron":
-                    print(f"custom_dict is {custom_dict}")
-                    get_args().customize_dict = custom_dict
-            else:
-                trainer_state_path = None
-                if args.distributed_type == "megatron":
-                    if self.train_engine.iteration > 0:
-                        trainer_state_path = os.path.join(
-                            resume_from_checkpoint, "iter_{:07d}".format(self.train_engine.iteration)
-                        )
-                else:
-                    trainer_state_path = resume_from_checkpoint
-                if trainer_state_path is not None:
-                    self.state = AtorchTrainerState.load_from_json(os.path.join(trainer_state_path, TRAINER_STATE_NAME))
             epochs_trained = self.state.global_step // num_update_steps_per_epoch
             if not args.ignore_data_skip:
                 steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
@@ -456,8 +459,6 @@ class AtorchTrainerV2:
 
         self.train_engine.optimizer_zero_grad()
 
-        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
-
         # Empty redundant memory.
         torch.cuda.empty_cache()
 
@@ -481,6 +482,9 @@ class AtorchTrainerV2:
             gc.collect()
 
         dist.barrier()
+
+        # train begin after all ranks reach here
+        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
         # Print all args before training.
         if self.args.is_local_main_process:
@@ -555,13 +559,6 @@ class AtorchTrainerV2:
                         torch.cuda.cudart().cudaProfilerStart()
                         torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
-                    if self.args.flash_checkpoint and self.distributed_type == DistributedType.MEGATRON:
-                        from dlrover.trainer.torch.flash_checkpoint.megatron_async_save.megatron_async_torch_save import (  # noqa: E501
-                            maybe_finalize_async_save,
-                        )
-
-                        maybe_finalize_async_save(False)
-
                     total_batched_samples += 1
                     if rng_to_sync:
                         self._load_rng_state(resume_from_checkpoint)
@@ -588,6 +585,9 @@ class AtorchTrainerV2:
                         # forward, backward, optimizer.step(), zero_grad()
                         loss = self.train_engine(inputs)
                         self.state.consumed_train_samples = megatron_args.consumed_train_samples
+                        self.state.consumed_train_tokens = (
+                            megatron_args.consumed_train_samples * megatron_args.seq_length
+                        )
                         self.state.total_flos = self.train_engine.num_floating_point_operations_so_far
                     else:
                         with self.train_engine.accumulate():
@@ -599,6 +599,7 @@ class AtorchTrainerV2:
                             self.train_engine.scheduler_step()
                             self.train_engine.optimizer_zero_grad()
                         self.state.consumed_train_samples += self.args.global_train_batch_size
+                        # TODO: record consumed_train_tokens
 
                     if args.logging_nan_inf_filter and (torch.isnan(loss) or torch.isinf(loss)):
                         # if loss is nan or inf simply add the average of previous logged losses
@@ -620,6 +621,8 @@ class AtorchTrainerV2:
                         self.state.current_step_in_epoch = step + 1 + steps_skipped
                         self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
+                        # TODO: mix log,save and evaluate in one function is not a good practice, split and control
+                        # separately.
                         self._maybe_log_save_evaluate(tr_loss, self.model, epoch)
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
@@ -647,6 +650,7 @@ class AtorchTrainerV2:
                             self.args.manual_gc_interval != 0
                             and self.state.global_step % self.args.manual_gc_interval == 0
                         ):
+                            logger.info("Execute GC manually.")
                             gc.collect()
 
                     if self.control.should_epoch_stop or self.control.should_training_stop:
@@ -675,13 +679,6 @@ class AtorchTrainerV2:
         # metrics["total_flos"] = self.state.total_flos
         metrics["train_loss"] = train_loss
 
-        if self.args.flash_checkpoint and self.distributed_type == DistributedType.MEGATRON:
-            from dlrover.trainer.torch.flash_checkpoint.megatron_async_save.megatron_async_torch_save import (
-                maybe_finalize_async_save,
-            )
-
-            maybe_finalize_async_save(True)
-
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
         return TrainOutput(global_step=self.state.global_step, training_loss=train_loss, metrics=metrics)
@@ -690,29 +687,30 @@ class AtorchTrainerV2:
         if self.distributed_type == DistributedType.MEGATRON:
             timers = get_timers()
 
-        if self.control.should_log:
-            if self.distributed_type == DistributedType.MEGATRON:
-                logging_metrics = self.train_engine.training_log()
+        if self.distributed_type == DistributedType.MEGATRON:
+            logging_metrics = self.train_engine.training_log()
+            if self.control.should_log:
                 self.log(logging_metrics)
-            else:
-                logs: Dict[str, float] = {}
 
-                # all_gather + mean() to get average loss over all processes
-                tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+        if self.control.should_log and self.distributed_type != DistributedType.MEGATRON:
+            logs: Dict[str, float] = {}
 
-                logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-                logs["learning_rate"] = self._get_learning_rate()
+            # all_gather + mean() to get average loss over all processes
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
 
-                self._total_loss_scalar += tr_loss_scalar
-                self._globalstep_last_logged = self.state.global_step
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["learning_rate"] = self._get_learning_rate()
 
-                self.log(logs)
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+
+            self.log(logs)
 
             # reset tr_loss to zero
             tr_loss -= tr_loss
 
-        metrics = None
-        if self.control.should_evaluate:
+        def _eval(eval_or_test):
+            metrics = None
             if self.args.manual_gc and self.args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -720,14 +718,26 @@ class AtorchTrainerV2:
                 megatron_args = get_args()
                 timers("interval-time").stop()
                 if megatron_args.use_distributed_optimizer and megatron_args.overlap_param_gather:
-                    self.train_engine.optimizer.disable_pre_hook()
-                metrics = self.evaluate()
+                    try:
+                        from megatron.training.training import disable_forward_pre_hook  # adapt for megatron 0.10
+
+                        disable_forward_pre_hook(self.train_engine.module)
+                    except ImportError:
+                        self.train_engine.optimizer.disable_pre_hook()
+
+                metrics = self.evaluate(eval_or_test=eval_or_test)
                 if megatron_args.use_distributed_optimizer and megatron_args.overlap_param_gather:
-                    self.train_engine.optimizer.enable_pre_hook()
+                    try:
+                        from megatron.training.training import enable_forward_pre_hook  # adapt for megatron 0.10
+
+                        enable_forward_pre_hook(self.train_engine.module)
+                    except ImportError:
+                        self.train_engine.optimizer.enable_pre_hook()
+
                 timers("interval-time", log_level=0).start(barrier=True)
             else:
                 # TODO: Implement evaluate
-                metrics = self.evaluate()
+                metrics = self.evaluate(eval_or_test=eval_or_test)
 
                 # Run delayed LR scheduler now that metrics are populated
                 if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -739,36 +749,27 @@ class AtorchTrainerV2:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
 
+        if self.control.should_evaluate:
+            _eval(eval_or_test="eval")
+        if self.control.should_test:
+            _eval(eval_or_test="test")
+
+        # self.train_engine.post_training_step()
+
         if self.control.should_save:
             # Save model checkpoint
-            if self.distributed_type == DistributedType.MEGATRON:
-                timers("interval-time").stop()
+            self.control = self.callback_handler.on_save_begin(self.args, self.state, self.control)
+            timers("interval-time").stop()
+            torch.distributed.barrier()
 
-                checkpoint_dir_path = self.train_engine.get_checkpoint_path_dir(
-                    self.args.output_dir, return_base_dir=True
-                )
+            self.train_engine.save_checkpoint(
+                Path(self.args.output_dir),
+                best_model_checkpoint=self.state.best_model_checkpoint,
+            )
 
-                if self.args.is_main_process:
-                    os.makedirs(checkpoint_dir_path, exist_ok=True)
+            timers("interval-time", log_level=0).start(barrier=True)
 
-                torch.distributed.barrier()
-
-                self.train_engine.save_checkpoint(
-                    self.args.output_dir,
-                    best_model_checkpoint=self.state.best_model_checkpoint,
-                    trainer_state=dataclasses.asdict(self.state),
-                )
-
-                if self.args.is_main_process:
-                    checkpoint_dir_path = self.train_engine.get_checkpoint_path_dir(
-                        get_args().save, return_base_dir=True
-                    )
-                    self.state.save_to_json(os.path.join(checkpoint_dir_path, TRAINER_STATE_NAME))
-
-                timers("interval-time", log_level=0).start(barrier=True)
-            else:
-                # TODO: Save checkpoint for other cases
-                raise NotImplementedError("Not implemented saving checkpoint.")
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def log(self, logs: Dict[str, float]) -> None:
         """
@@ -832,6 +833,7 @@ class AtorchTrainerV2:
         eval_dataset: Optional[Dataset] = None,
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
+        eval_or_test: str = "eval",  # ["eval", "test"]
     ) -> Dict[str, float]:
         """
         Run evaluation and returns metrics.
@@ -857,11 +859,13 @@ class AtorchTrainerV2:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
         """
+        assert eval_or_test in ["eval", "test"]
         if self.distributed_type == DistributedType.MEGATRON:
-            eval_dataloader = self.train_engine.get_dataloader("eval")
+            eval_dataloader = self.train_engine.get_dataloader(eval_or_test)
             megatron_args = get_args()
-            if megatron_args.eval_iters > 0:
-                max_eval_steps = megatron_args.eval_iters
+            eval_iters = getattr(megatron_args, f"{eval_or_test}_iters", 0)
+            if eval_iters > 0:
+                max_eval_steps = eval_iters
             else:
                 max_eval_steps = len(eval_dataloader)
         else:
@@ -869,10 +873,13 @@ class AtorchTrainerV2:
             raise ValueError(f"Evaluation on {self.distributed_type} not implement.")
 
         self.train_engine.eval()
+        self.control = self.callback_handler.on_evaluate_begin(
+            self.args, self.state, self.control, eval_type=eval_or_test
+        )
 
         batch_size = self.args.global_eval_batch_size
 
-        logger.info("***** Running Evaluation *****")
+        logger.info(f"***** Running Evaluation (do {eval_or_test}) *****")
         if self.distributed_type == DistributedType.MEGATRON:
             num_examples = max_eval_steps * megatron_args.global_batch_size
             logger.info(f"  Num examples = {num_examples}")
@@ -902,7 +909,9 @@ class AtorchTrainerV2:
                 # TODO: Implement loss gathering.
                 pass
 
-            self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
+            self.control = self.callback_handler.on_prediction_step(
+                self.args, self.state, self.control, eval_iters=max_eval_steps
+            )
 
             if step >= max_eval_steps - 1:
                 break
@@ -916,7 +925,7 @@ class AtorchTrainerV2:
         except OverflowError:
             perplexity = float("inf")
 
-        eval_log = {"eval_loss": eval_loss, "perplexity": perplexity}
+        eval_log = {f"{eval_or_test}_loss": eval_loss, f"{eval_or_test}_perplexity": perplexity}
 
         self.log(eval_log)
 

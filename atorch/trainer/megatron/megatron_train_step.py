@@ -8,6 +8,7 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 
+from atorch.common.log_utils import default_logger as logger
 from atorch.trainer.base.train_step import AtorchTrainStep
 from atorch.utils.import_util import is_megatron_lm_available
 
@@ -126,27 +127,99 @@ def get_batch_on_this_tp_rank(data_iterator):
 
 
 class MegatronTrainStep(AtorchTrainStep):
-    def loss_postprocessing(self, losses_reduced):
+    def loss_postprocessing(self, monitor_dict):
         """
         Loss postprocessing. Average losses across all micro-batches.
+
+        Args:
+            monitor_dict: a dict to hold all related monitored matrix
+                In train process: {"losses_reduced": [], "total_grad_norm": float or None}
+                    losses_reduced: (List[torch.Tensor]):
+                        A list of losses whose length equals to the number of microbatches, `global_batch_size/data_parallel_size/micro_batch_size`.  # noqa E501
+                    total_grad_norm (Only in training process):
+                        total grad_norm (for all params).
+                In eval or test process: {"losses_reduced": []}
+                    losses_reduced: (List[torch.Tensor])
+        Returns:
+            A dict:
+                In train process: return {"loss_to_log": Dict, "spike_loss_ratio": float or None}
+                    The first one is a train loss dict to log, and the second one is a ratio if the spike loss occurs.
+                In eval or test process: return {"loss_to_log": Dict}
+        """
+
+        args = get_args()
+
+        assert "losses_reduced" in monitor_dict
+
+        losses_reduced = monitor_dict.get("losses_reduced", None)
+
+        # args.forward_mode is a internal intermediate variable to indicate current forward mode.
+        # args.forward_mode belongs to ["train", "eval", "test"]
+        if args.forward_mode == "train":
+            total_grad_norm = monitor_dict.get("total_grad_norm", None)  # noqa: F841
+            res = {"loss_to_log": {}, "spike_loss_ratio": None}
+        else:
+            res = {"loss_to_log": {}}
+
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            # Average loss across microbatches.
+            loss_reduced = {}
+            for key in losses_reduced[0].keys():
+                numerator = 0
+                denominator = 0
+                for x in losses_reduced:
+                    val = x[key]
+                    # there is one dict per microbatch. in new reporting, we average
+                    # over the total number of tokens across the global batch.
+                    if isinstance(val, tuple) or isinstance(val, list):
+                        numerator += val[0]
+                        denominator += val[1]
+                    else:
+                        # legacy behavior. we average over the number of microbatches,
+                        # and so the denominator is 1.
+                        numerator += val
+                        denominator += 1
+                loss_reduced[key] = numerator / denominator
+            res["loss_to_log"] = loss_reduced
+        return res
+
+    # Deprecated! Please use loss_postprocessing() instead.
+    def validation_loss_postprocessing(self, losses_reduced):
+        """
+        Validation loss postprocessing. Average losses across all micro-batches.
 
         Args:
             losses_reduced: (List[torch.Tensor]):
                 A list of losses with a length of pipeline depth, which is equal to
                 `global_batch_size/data_parallel_size/micro_batch_size`.
         Returns:
-            A 2-tuple, the first element is a loss dict to log, and the second element is
-            a ratio if the spike loss condition is met; otherwise, it will be None.
-
+            A eval loss dict to log.
         """
+        logger.warning(
+            "validation_loss_postprocessing() is deprecated! Please upgrade your loss_postprocessing(): "
+            "move the eval loss postprocessing to loss_postprocessing() function."
+        )
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             # Average loss across microbatches.
             loss_reduced = {}
-            for key in losses_reduced[0]:
-                losses_reduced_for_key = [x[key] for x in losses_reduced]
-                loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-            return loss_reduced, None
-        return {}, None
+            for key in losses_reduced[0].keys():
+                numerator = 0
+                denominator = 0
+                for x in losses_reduced:
+                    val = x[key]
+                    # there is one dict per microbatch. in new reporting, we average
+                    # over the total number of tokens across the global batch.
+                    if isinstance(val, tuple) or isinstance(val, list):
+                        numerator += val[0]
+                        denominator += val[1]
+                    else:
+                        # legacy behavior. we average over the number of microbatches,
+                        # and so the denominator is 1.
+                        numerator += val
+                        denominator += 1
+                loss_reduced[key] = numerator / denominator
+            return loss_reduced
+        return {}
 
 
 class GPTTrainStep(MegatronTrainStep):

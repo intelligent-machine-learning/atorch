@@ -148,3 +148,23 @@ def is_liger_kernel_available():
     else:
         _HAS_LIGER_KERNEL = True
     return _HAS_LIGER_KERNEL
+
+
+def is_training_event_available():
+    try:
+        from dlrover.python.training_event import TrainerProcess  # noqa: F401
+
+        return True
+
+    except Exception:
+        return False
+
+
+def is_deep_gemm_available():
+    try:
+        import deep_gemm  # noqa: F401
+
+        return True
+    except (ImportError, ModuleNotFoundError):
+        print("Can't import deep_gemm, please check if deep_gemm is installed or in PYTHONPATH.")
+        return False

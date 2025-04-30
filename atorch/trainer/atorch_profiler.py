@@ -1,10 +1,13 @@
 import os
 import shutil
+import socket
 import tempfile
 from contextlib import nullcontext
 
+import atorch
 from atorch.common.log_utils import default_logger as logger
 from atorch.trainer.args import AtorchTrainingArgs
+from atorch.utils.dynamic_profiler import init
 
 
 def get_profiler(args: AtorchTrainingArgs):
@@ -104,6 +107,23 @@ def get_profiler(args: AtorchTrainingArgs):
         if profiler_file_path is not None and profiler_type is not None:
             os.makedirs(profiler_file_path, exist_ok=True)
 
+        rank = atorch.rank()
+
+        def trace_handler():
+            if args.profile_ranks == [-1] or rank in args.profile_ranks:
+                return torch.profiler.tensorboard_trace_handler(
+                    profiler_file_path,
+                    worker_name=f"torch_profiler_rank{rank}_{socket.gethostname()}_{os.getpid()}",
+                    use_gzip=args.profile_use_gzip,
+                )
+            else:
+
+                def _dummy_writer(p):
+                    # Do nothing
+                    pass
+
+                return _dummy_writer
+
         default_profiler_config = dict(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             with_stack=False,
@@ -116,10 +136,25 @@ def get_profiler(args: AtorchTrainingArgs):
                 repeat=args.profiler_schedule_repeat,
                 skip_first=args.profiler_schedule_skip_first,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_file_path),
+            on_trace_ready=trace_handler(),
         )
         default_profiler_config.update(profiler_config)
         return torch.profiler.profile(**default_profiler_config)
+
+    elif profiler_type == "nv_dp":
+        assert (
+            args.dynamic_profiler_config_path is not None
+        ), "Please set the arg 'dynamic_profiler_config_path' when using nv dynamic profiler."
+
+        try:
+            init(args.dynamic_profiler_config_path)
+        except Exception as e:
+            logger.warning(f"Failed to initialize dynamic profiler: {e}")
+
+        return nullcontext()
+
     else:
-        logger.warning(f"Unsupported profiler_type:{profiler_type}. Please use one of ['hw', 'hw_dp', 'nv', 'nsys'].")
+        logger.warning(
+            f"Unsupported profiler_type:{profiler_type}. Please use one of ['hw', 'hw_dp', 'nv', 'nv_dp', 'nsys']."
+        )
         return nullcontext()

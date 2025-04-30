@@ -356,6 +356,15 @@ def main():
             f"selected. But got relaunch_on_hanging={args.relaunch_on_hanging}, fault_tolerant={args.fault_tolerant},"
             f" elastic={args.elastic}."
         )
+
+    try:
+        from dlrover.python.training_event import TrainerProcess
+
+        trainer_process = TrainerProcess(target="atorch_agent")
+        trainer_process.start(params=vars(args))
+    except Exception:
+        pass
+
     if args.ib_stat_kw:
         split = args.ib_stat_kw.split(",")
         if len(split) != 3:
@@ -368,11 +377,11 @@ def main():
         IBStat(interval, count, path)
     if args.elastic is True:
         args = parse_fault_tolerant_or_elastic_args(unknown_args, "elastic")
-        hook_set_master_addr_port()
+        hook_set_master_addr_port(args)
         elastic_run(args)
     elif args.fault_tolerant is True:
         args = parse_fault_tolerant_or_elastic_args(unknown_args, "fault_tolerant")
-        hook_set_master_addr_port()
+        hook_set_master_addr_port(args)
         elastic_run(args)
     elif args.relaunch_on_hanging is True:
         if torch_version() >= (2, 2, 0):

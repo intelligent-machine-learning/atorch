@@ -55,6 +55,7 @@ class MOEContext(metaclass=SingletonMeta):
     OLD_POST_BACKWARD_HOOK = None
     OLD_PREFETCH_HANDLE = None
     OLD_CHECKPOINT_HOOK = None
+    MLP_PREFIX_FROM_USER_ARG: Optional[bool] = None
 
 
 def patch_fsdp_post_backward_hook():
@@ -370,7 +371,10 @@ class Grouped_GEMM_MoE(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        self.mlp_prefix = EnvSetting().MOE_MLP_PREFIX
+        mlp_prefix_from_env = EnvSetting().MOE_MLP_PREFIX
+        mlp_prefix_from_user_arg = MOEContext().MLP_PREFIX_FROM_USER_ARG
+
+        self.mlp_prefix = mlp_prefix_from_user_arg if mlp_prefix_from_user_arg is not None else mlp_prefix_from_env
         self.implementer_type = MOEImplmenterType(implementation_type)
         self.token_dispatcher_type = MOETokenDispatcherType(token_dispatcher_type)
         if is_torch_npu_available():

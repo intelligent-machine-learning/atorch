@@ -114,6 +114,7 @@ class MyModel(nn.Module):
                 p.data.zero_()
             elif "weight" in name:
                 p.data.mul_(init_scale)
+        self.register_buffer("test_buffer", torch.randn(10, 10))
 
     def forward(self, x):
         return self.ln(self.layers(x))
@@ -166,6 +167,25 @@ class TestMetaInit(unittest.TestCase):
         for name, params in model.named_parameters():
             self.assertTrue(params.device.type == "meta")
         # reload_meta_module(model, "cpu")
+
+    def test_double_load_state_dict(self):
+        with tempfile.TemporaryFile() as fp:
+            with init_empty_weights_with_disk_offload():
+                model = MyModel(5, self.embed_dim)
+                torch.save(model.state_dict(), fp)
+                fp.seek(0)
+            params_name2chk_name = {}
+            for name, p in model.named_parameters():
+                if hasattr(p, "checkpoint_name"):
+                    params_name2chk_name[name] = p.checkpoint_name
+            with init_empty_weights_with_disk_offload():
+                model = MyModel(5, self.embed_dim)
+                sd = torch.load(fp, map_location="cpu")
+                model.load_state_dict(sd)
+                # load twice
+                model.load_state_dict(sd)
+            for name, p in model.named_parameters():
+                self.assertEqual(params_name2chk_name[name], p.checkpoint_name)
 
 
 def _test_init_auto_accelerate(rank, world_size):

@@ -1,3 +1,4 @@
+import math
 import os
 import pickle
 from datetime import datetime
@@ -21,6 +22,7 @@ except ImportError:
 import atorch
 from atorch.common.log_utils import default_logger as logger
 from atorch.utils.import_util import is_megatron_lm_available
+from atorch.utils.version import is_megatron_version_bigger_than
 
 if is_megatron_lm_available():
     from megatron.core import mpu, tensor_parallel
@@ -465,6 +467,12 @@ def training_log(
         moe_loss_scale = 1 / get_num_microbatches()
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
 
+    if hasattr(args, "mtp_num_layers") and args.mtp_num_layers is not None:
+        from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+        mtp_loss_scale = 1 / get_num_microbatches()
+        MTPLossLoggingHelper.track_mtp_metrics(mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict)
+
     if iteration % args.log_interval == 0:
         elapsed_time = timers("interval-time").elapsed(
             barrier=not (hasattr(args, "use_local_sgd") and args.use_local_sgd)
@@ -548,6 +556,7 @@ def training_log(
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory("(after {} iterations)".format(iteration))
             report_memory_flag = False
+
         if hasattr(args, "use_local_sgd") and args.use_local_sgd:
             # Lazy import patches for local sgd logging
             from atorch.local_sgd.megatron.parallel_state import get_non_data_parallel_group
@@ -664,7 +673,10 @@ def get_main_grads_in_params(model_chunks: List["MegatronModule"]):
 
 
 def scale_main_grad_for_spike_loss(
-    model_chunks: List["MegatronModule"], spike_loss_ratio: float, log_grad_diff_for_debug: bool = False
+    model_chunks: List["MegatronModule"],
+    spike_loss_ratio: float,
+    log_grad_diff_for_debug: bool = False,
+    optimizer: "MegatronOptimizer" = None,
 ):
     """
     Scale main_grad of model params.
@@ -674,14 +686,17 @@ def scale_main_grad_for_spike_loss(
     grads_for_scaling = get_main_grads_in_params(model_chunks)
 
     if log_grad_diff_for_debug:
-        original_grad_norm = get_grad_norm_fp32(grads_for_scaling, model_parallel_group=mpu.get_model_parallel_group())
+        assert (
+            optimizer is not None
+        ), "You should pass optimizer to scale_main_grad_for_spike_loss() when log_grad_diff_for_debug is True."
+        original_grad_norm = get_grad_norm_in_optimizer(optimizer)
 
     # Scale grad for spike loss
     for grad in grads_for_scaling:
         grad *= spike_loss_ratio
 
     if log_grad_diff_for_debug:
-        scaled_grad_norm = get_grad_norm_fp32(grads_for_scaling, model_parallel_group=mpu.get_model_parallel_group())
+        scaled_grad_norm = get_grad_norm_in_optimizer(optimizer)
         logger.info(
             f"[Rank {torch.distributed.get_rank()}] after scaling grad with ratio {spike_loss_ratio}, "
             f"grad norm {original_grad_norm} -> {scaled_grad_norm}"
@@ -701,6 +716,43 @@ def get_grads_in_optimizer(optimizer: "MegatronOptimizer"):
         raise ValueError(f"Unsupported optimizer type {type(optimizer)}")
 
 
+def _get_grad_state_model_parallel_group(optimizer: "MegatronOptimizer"):
+    if is_megatron_version_bigger_than("0.10.0"):
+        return optimizer.get_grad_stats_parallel_group()
+    else:
+        return optimizer.get_model_parallel_group()
+
+
+def get_grad_norm_in_optimizer(optimizer: "MegatronOptimizer"):
+    if isinstance(optimizer, (DistributedOptimizer, Float16OptimizerWithFloat16Params)):
+        grads_for_norm = get_grads_in_optimizer(optimizer)
+        return get_grad_norm_fp32(
+            grads_for_norm,
+            model_parallel_group=_get_grad_state_model_parallel_group(optimizer),
+        )
+    elif isinstance(optimizer, ChainedOptimizer):
+        grad_norms = []
+        for single_optimizer in optimizer.chained_optimizers:
+            grad_norms.append(get_grad_norm_in_optimizer(single_optimizer))
+        return math.sqrt(sum([x**2 for x in grad_norms]))
+    else:
+        raise ValueError(f"Unsupported optimizer type {type(optimizer)}")
+
+
+def count_zeros_in_grad(optimizer: "MegatronOptimizer"):
+    if isinstance(optimizer, (DistributedOptimizer, Float16OptimizerWithFloat16Params)):
+        return optimizer.count_zeros()
+    elif isinstance(optimizer, ChainedOptimizer):
+        num_zeros_in_grad = 0
+        for single_optimizer in optimizer.chained_optimizers:
+            _num_zeros_in_grad = count_zeros_in_grad(single_optimizer)
+            num_zeros_in_grad += _num_zeros_in_grad if _num_zeros_in_grad else 0
+        return num_zeros_in_grad
+    else:
+        raise ValueError(f"Unsupported optimizer type {type(optimizer)}")
+
+
+# This function is deprecated, to be removed.
 def scale_grad_for_spike_loss(
     optimizer: "MegatronOptimizer", spike_loss_ratio: float, log_grad_diff_for_debug: bool = False
 ):
@@ -712,14 +764,14 @@ def scale_grad_for_spike_loss(
     grads_for_scaling = get_grads_in_optimizer(optimizer)
 
     if log_grad_diff_for_debug:
-        original_grad_norm = get_grad_norm_fp32(grads_for_scaling, model_parallel_group=mpu.get_model_parallel_group())
+        original_grad_norm = get_grad_norm_in_optimizer(optimizer)
 
     # Scale grad for spike loss
     for grad in grads_for_scaling:
         grad *= spike_loss_ratio
 
     if log_grad_diff_for_debug:
-        scaled_grad_norm = get_grad_norm_fp32(grads_for_scaling, model_parallel_group=mpu.get_model_parallel_group())
+        scaled_grad_norm = get_grad_norm_in_optimizer(optimizer)
         logger.info(
             f"[Rank {torch.distributed.get_rank()}] after scaling grad with ratio {spike_loss_ratio}, "
             f"grad norm {original_grad_norm} -> {scaled_grad_norm}"

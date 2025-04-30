@@ -9,6 +9,7 @@ from torch.distributed.fsdp.api import ShardedOptimStateDictConfig, ShardedState
 
 from atorch.common.log_utils import default_logger as logger
 from atorch.common.log_utils import log_rank_0
+from atorch.trainer.args import AtorchTrainingArgs
 from atorch.trainer.fsdp.fsdp_ckpt_loader import FsdpCkptLoader
 from atorch.trainer.fsdp.fsdp_ckpt_saver import ExtraState, get_ckpt_trace_file_path
 from atorch.trainer.fsdp.fsdp_shard_async_saver import FsdpShardDcpCkpt
@@ -45,7 +46,14 @@ def get_ckpt_meta(trace_filename):
 
 class FsdpShardDcpCkptLoader(FsdpCkptLoader):
     def load(
-        self, resume_from_ckpt, model, optimizer=None, extra_state: ExtraState = None, ckpt_step=None, **kwargs
+        self,
+        resume_from_ckpt,
+        model,
+        train_args: AtorchTrainingArgs = None,
+        optimizer=None,
+        extra_state: ExtraState = None,
+        ckpt_step=None,
+        **kwargs,
     ) -> int:
         if not resume_from_ckpt:
             log_rank_0("No sharded_state_dict checkpoint directory found")

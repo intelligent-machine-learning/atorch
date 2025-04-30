@@ -1,18 +1,23 @@
+import glob
+import json
 import os
 import subprocess
+import sys
 from functools import partial
 from typing import Union
 from urllib.request import urlretrieve
 
 import pytest
-from packaging import version
+import torch
 
 import atorch
 from atorch.common.log_utils import default_logger as logger
 
-torch = pytest.importorskip("torch", minversion="2.0.9")
-if torch.version.git_version != "7bcf7da3a268b435777fe87c7794c382f444e86d" or not torch.cuda.is_available():
-    pytest.skip("requires pytorch 2.1 stable release", allow_module_level=True)
+pytestmark = pytest.mark.core24
+
+pytest.importorskip("torch", minversion="2.0.9")
+# if torch.version.git_version != "7bcf7da3a268b435777fe87c7794c382f444e86d" or not torch.cuda.is_available():
+#     pytest.skip("requires pytorch 2.1 stable release", allow_module_level=True)
 
 try:
     import ant_patches
@@ -30,7 +35,7 @@ from atorch.trainer.args import AtorchTrainingArgs  # noqa: E402
 from atorch.trainer.atorch_trainer_v2 import AtorchTrainerV2  # noqa: E402
 from atorch.trainer.megatron import MegatronTrainStep  # noqa: E402
 from atorch.utils.import_util import is_coverage_available, is_megatron_lm_available  # noqa: E402
-from atorch.utils.version import torch_version  # noqa: E402
+from atorch.utils.version import is_megatron_version_bigger_than, torch_version  # noqa: E402
 
 assert is_megatron_lm_available(), f"Can't import megatron, PYTHONPATH={os.environ['PYTHONPATH']}"
 
@@ -44,8 +49,8 @@ if is_megatron_lm_available():
         get_gpt_layer_local_spec,
         get_gpt_layer_with_transformer_engine_spec,
     )
-    from megatron.core.package_info import __version__ as megatron_version
     from megatron.core.transformer.spec_utils import import_module
+    from megatron.legacy.data.data_samplers import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
     from megatron.training import get_args, get_tokenizer, print_rank_0
     from megatron.training.arguments import core_transformer_config_from_args
     from megatron.training.utils import (
@@ -131,7 +136,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     def core_gpt_dataset_config_from_args(args):
         tokenizer = get_tokenizer()
 
-        if version.parse(megatron_version) > version.parse("0.6.0"):
+        if is_megatron_version_bigger_than("0.6.0", check_equality=False):
             from megatron.core.datasets.utils import get_blend_from_list
 
             return GPTDatasetConfig(
@@ -143,7 +148,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                     get_blend_from_list(args.valid_data_path),
                     get_blend_from_list(args.test_data_path),
                 ],
-                renormalize_blend_weights=args.renormalize_blend_weights,
+                # renormalize_blend_weights=args.renormalize_blend_weights,
                 split=args.split,
                 num_dataset_builder_threads=args.num_dataset_builder_threads,
                 path_to_cache=args.data_cache_path,
@@ -193,6 +198,158 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
+
+
+def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+    """Build pretraining data iterators."""
+
+    def get_train_valid_test_num_samples():
+        """Train/valid/test num samples."""
+
+        args = get_args()
+
+        # Number of train/valid/test samples.
+        if args.train_samples:
+            train_samples = args.train_samples
+        else:
+            train_samples = args.train_iters * args.global_batch_size
+        eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+        if hasattr(args, "test_iters"):
+            test_iters = args.test_iters
+        else:
+            test_iters = args.eval_iters
+
+        return (
+            train_samples,
+            eval_iters * args.global_batch_size,
+            test_iters * args.global_batch_size,
+        )
+
+    def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
+        """Build pretraining datasets."""
+        train_valid_test_num_samples = get_train_valid_test_num_samples()
+        print_rank_0(" > datasets target sizes (minimum size):")
+        print_rank_0("    train:      {}".format(train_valid_test_num_samples[0]))
+        print_rank_0("    validation: {}".format(train_valid_test_num_samples[1]))
+        print_rank_0("    test:       {}".format(train_valid_test_num_samples[2]))
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+
+    def build_pretraining_data_loader(dataset, consumed_samples):
+        """Build dataloader given an input dataset."""
+
+        if dataset is None:
+            return None
+        args = get_args()
+
+        # Megatron sampler
+        if args.dataloader_type == "single":
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=args.micro_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+            )
+        elif args.dataloader_type == "cyclic":
+            batch_sampler = MegatronPretrainingRandomSampler(
+                dataset,
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=args.micro_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+                data_sharding=args.data_sharding,
+            )
+        elif args.dataloader_type == "external":
+            # External dataloaders are passed through. User is expected to provide a
+            # torch-compatible dataloader and define samplers, if needed.
+            return dataset
+        else:
+            raise Exception("{} dataloader type is not supported.".format(args.dataloader_type))
+
+        # Torch dataloader.
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+        )
+
+    def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+        """Build pretraining data loaders."""
+
+        args = get_args()
+
+        (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
+
+        print_rank_0("> building train, validation, and test datasets ...")
+
+        # Backward compatibility, assume fixed batch size.
+        if args.iteration > 0 and args.consumed_train_samples == 0:
+            assert args.train_samples is None, "only backward compatiblity support for iteration-based training"
+            args.consumed_train_samples = args.iteration * args.global_batch_size
+        if args.iteration > 0 and args.consumed_valid_samples == 0:
+            if args.train_samples is None:
+                args.consumed_valid_samples = (
+                    (args.iteration // args.eval_interval) * args.eval_iters * args.global_batch_size
+                )
+
+        # Rely on distributed-aware core datasets, temporary
+        is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
+
+        # Construct the data pipeline
+        if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
+
+            # Build datasets.
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            # Build dataloders.
+            train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+            if args.skip_train:
+                valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
+            else:
+                valid_dataloader = build_pretraining_data_loader(valid_ds, args.consumed_valid_samples)
+            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+
+            # Flags to know if we need to do training/validation/testing.
+            do_train = train_dataloader is not None and args.train_iters > 0
+            do_valid = valid_dataloader is not None and args.eval_iters > 0
+            do_test = test_dataloader is not None and args.eval_iters > 0
+            flags = torch.tensor(
+                [int(do_train), int(do_valid), int(do_test)],
+                dtype=torch.long,
+                device="cuda",
+            )
+        else:
+            flags = torch.tensor([0, 0, 0], dtype=torch.long, device="cuda")
+
+        torch.distributed.broadcast(flags, 0)
+
+        args.do_train = getattr(args, "do_train", False) or flags[0].item()
+        args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
+        args.do_test = getattr(args, "do_test", False) or flags[2].item()
+
+        return train_dataloader, valid_dataloader, test_dataloader
+
+    args = get_args()
+
+    # Build loaders.
+    train_dataloader, valid_dataloader, test_dataloader = build_train_valid_test_data_loaders(
+        build_train_valid_test_datasets_provider
+    )
+
+    if train_dataloader is not None:
+        logger.info(f"[Rank {args.rank}] build dataloader over!")
+        logger.info(
+            f"[Rank {args.rank}] train_dataloader {len(train_dataloader)} valid_dataloader {len(valid_dataloader)}"
+            f" test_dataloader {len(test_dataloader)}",
+        )
+        logger.info(
+            f"[Rank {args.rank}] train_dataset {len(train_dataloader.dataset)}"
+            f" valid_dataset {len(valid_dataloader.dataset)} test_dataset {len(test_dataloader.dataset)}",
+        )
+
+    return train_dataloader, valid_dataloader, test_dataloader
 
 
 class GPTTrainStep(MegatronTrainStep):
@@ -303,6 +460,29 @@ def download_tokenizer_file():
 
 def run_atorch_trainer_v2():
     output_dir = "/tmp/output_atorch_trainer"
+
+    # test nv dynamic profiler
+    with open("/tmp/profile_config.json", "w") as f:
+        json.dump(
+            {
+                "enabled": True,
+                "output_dir": "/tmp/profile",
+                "start_step": 10,
+                "schedule_warmup": 2,
+                "schedule_active": 1,
+                "with_stack": False,
+                "with_flops": False,
+                "with_modules": False,
+                "record_shapes": False,
+                "profile_memory": False,
+                "acc_events": False,
+                "activities": ["CPU", "CUDA"],
+                "profile_ranks": [-1],
+                "use_gzip": True,
+            },
+            f,
+        )
+
     training_args = AtorchTrainingArgs(
         distributed_type="megatron",
         output_dir=output_dir,
@@ -316,11 +496,17 @@ def run_atorch_trainer_v2():
         save_total_limit=1,
         evaluation_strategy="steps",
         eval_steps=25,
+        test_strategy="steps",
+        test_steps=25,
+        test_on_save=True,
         logging_strategy="steps",
         logging_steps=1,
         logging_nan_inf_filter=False,
         gradient_checkpointing=False,
         tensorboard_dir=os.path.join(output_dir, "runs"),
+        use_deterministic_algorithms=True,
+        profiler_type="nv_dp",
+        dynamic_profiler_config_path="/tmp/profile_config.json",
     )
 
     train_valid_test_datasets_provider.is_distributed = True
@@ -328,7 +514,9 @@ def run_atorch_trainer_v2():
     megatron_args = dict(
         # Custom function
         custom_model_provider_function=model_provider,
-        custom_megatron_datasets_provider_function=train_valid_test_datasets_provider,
+        custom_megatron_dataloaders_provider_function=partial(
+            build_train_valid_test_data_iterators, train_valid_test_datasets_provider
+        ),
         custom_train_step_class=GPTTrainStep,
         # model args
         model_type_name="gpt",
@@ -370,6 +558,7 @@ def run_atorch_trainer_v2():
         recompute_granularity="selective",
         train_iters=25,
         eval_iters=5,
+        test_iters=5,
         # Distributed args
         tensor_model_parallel_size=2,
         pipeline_model_parallel_size=2,
@@ -398,6 +587,7 @@ def run_atorch_trainer_v2():
         mock_data=True,
         seq_length=512,
         num_workers=0,
+        mtp_num_layers=1,
     )
 
     if megatron_args["sequence_parallel"]:
@@ -414,8 +604,14 @@ def run_atorch_trainer_v2():
     atorch.reset_distributed()
 
 
+python_version = sys.version_info
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Skip cpu ut, only run on gpu.")
 @pytest.mark.skipif(torch_version() < (2, 0, 0), reason="AtorchTrainer need torch2.0 .")  # type: ignore
+@pytest.mark.skipif(
+    not (python_version.major >= 3 and python_version.minor >= 10), reason="Megatron 0.11 requires python >= 3.10"
+)
 @pytest.mark.parametrize("gpu_num", [4])
 def test_atorch_trainer(gpu_num):
 
@@ -434,6 +630,14 @@ def test_atorch_trainer(gpu_num):
     )
 
     subprocess.run(dist_cmd, check=True, shell=True)
+
+    # assert the gpu_num profile file is generated in /tmp/profile
+    profile_files = glob.glob("/tmp/profile/*.json.gz")
+    assert len(profile_files) == gpu_num
+
+    # assert the profile file is not empty
+    for profile_file in profile_files:
+        assert os.path.getsize(profile_file) > 0
 
 
 if __name__ == "__main__":

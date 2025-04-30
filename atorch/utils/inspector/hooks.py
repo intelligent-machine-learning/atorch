@@ -20,9 +20,11 @@ try:
 
     from atorch.modules.fp8 import PrecisionSwitchableLinear
 
-    _te_avalable = True
+    _te_available = True
+    _te_cast_fp8_available = hasattr(tex, "cast_to_fp8") and hasattr(texcpp, "cast_to_fp8")
 except (ImportError, ModuleNotFoundError):
-    _te_avalable = False
+    _te_available = False
+    _te_cast_fp8_available = False
 
 from atorch.common.log_utils import default_logger as logger
 from atorch.modules.fp8 import ScaledLinear
@@ -111,7 +113,7 @@ class TensorInspector:
                 re.search(log_tensor_name_pattern, name)
                 and (exclude_tensor_name_pattern is None or not re.search(exclude_tensor_name_pattern, name))
                 and (
-                    (_te_avalable and isinstance(layer, (TransformerEngineBaseModule, PrecisionSwitchableLinear)))
+                    (_te_available and isinstance(layer, (TransformerEngineBaseModule, PrecisionSwitchableLinear)))
                     or isinstance(layer, ScaledLinear)
                     or (layer_types is not None and isinstance(layer, layer_types))
                 )
@@ -218,7 +220,7 @@ def cosine(tensor1, tensor2):
 
 def get_fp8_meta(m):
     input_current_scaling = False
-    if not _te_avalable:
+    if not _te_available:
         return None, False
     if isinstance(m, PrecisionSwitchableLinear):
         input_current_scaling = m.use_input_current_scaling
@@ -239,11 +241,11 @@ def save_tensor_hook(module_name, inspector, is_fwd=True):
     if is_fwd:
         tensor_names = ["fwd_x", "fwd_y"]
         fp8_meta_key = "scaling_fwd"
-        fp8_gemm_type = tex.FP8FwdTensors.GEMM1_INPUT if _te_avalable else None
+        fp8_gemm_type = tex.FP8FwdTensors.GEMM1_INPUT if _te_available else None
     else:
         tensor_names = ["bwd_dx", "bwd_dy"]
         fp8_meta_key = "scaling_bwd"
-        fp8_gemm_type = tex.FP8BwdTensors.GRAD_OUTPUT1 if _te_avalable else None
+        fp8_gemm_type = tex.FP8BwdTensors.GRAD_OUTPUT1 if _te_available else None
 
     def hook(module, inputs, outputs):
         """Save input and output tensor to file"""
@@ -296,7 +298,7 @@ def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False
     if is_fwd:
         tensor_name = ["fwd_x", "fwd_w"]
         fp8_meta_key = "scaling_fwd"
-        fp8_gemm_type = [tex.FP8FwdTensors.GEMM1_INPUT, tex.FP8FwdTensors.GEMM1_WEIGHT] if _te_avalable else None
+        fp8_gemm_type = [tex.FP8FwdTensors.GEMM1_INPUT, tex.FP8FwdTensors.GEMM1_WEIGHT] if _te_available else None
         fp8_fmt = "e4m3"
     else:
         tensor_name = [
@@ -307,7 +309,7 @@ def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False
             [
                 tex.FP8BwdTensors.GRAD_OUTPUT1,
             ]
-            if _te_avalable
+            if _te_available
             else None
         )
         fp8_fmt = "e4m3" if backward_use_e4m3 else "e5m2"
@@ -344,7 +346,7 @@ def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False
                 # scale from current amax
                 act_scale = (
                     (Format.HYBRID.value.max_fwd if is_fwd else Format.HYBRID.value.max_bwd) / amax
-                    if _te_avalable
+                    if _te_available
                     else (448 / amax if is_fwd else 57344 / amax)
                 )
 
@@ -362,7 +364,7 @@ def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False
                 # FP8 quantization error
                 fp8_meta, input_current_scaling = get_fp8_meta(module)
                 use_current_scaling = is_fwd and index == 0 and input_current_scaling
-                if fp8_meta is not None:
+                if fp8_meta is not None and _te_cast_fp8_available:
                     # Q then DQ
                     t_fp8 = qdq(
                         nonzeros,

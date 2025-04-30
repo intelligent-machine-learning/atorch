@@ -10,7 +10,7 @@ except (ImportError, ModuleNotFoundError):
     from torch.distributed.elastic.utils.distributed import get_socket_with_port as _get_socket_with_port
 
 
-def hook_set_master_addr_port():
+def hook_set_master_addr_port(args=None):
     def _hook(store, master_addr, master_port, local_dir=None):
         """
         PyTorch use master node's hostname as the MASTER_ADDR of process group. However, hostname may not be resolved
@@ -32,4 +32,7 @@ def hook_set_master_addr_port():
         store.set("MASTER_PORT", str(master_port).encode(encoding="UTF-8"))
 
     # hook SimpleElasticAgent._set_master_addr_port
-    setattr(SimpleElasticAgent, "_set_master_addr_port", staticmethod(_hook))
+    if hasattr(SimpleElasticAgent, "_set_master_addr_port"):
+        setattr(SimpleElasticAgent, "_set_master_addr_port", staticmethod(_hook))
+    elif args and args.local_addr is None:
+        args.local_addr = os.environ.get("POD_IP") or socket.getfqdn()

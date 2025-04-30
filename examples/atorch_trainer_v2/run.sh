@@ -3,10 +3,11 @@ set -exo pipefail
 
 CONFIG_PATH=${1:-"$(dirname $0)/llama2_7b_config.yaml"}
 
-MEGATRON_PATH=/tmp/Megatron-LM
+MEGATRON_BRANCH=${MEGATRON_BRANCH:-core_r0.11.0}
+MEGATRON_PATH=/tmp/Megatron-LM-${MEGATRON_BRANCH}
 if [ ! -d ${MEGATRON_PATH} ]; then
     pushd $(dirname ${MEGATRON_PATH})
-    git clone -b core_r0.6.0 git@code.alipay.com:Arc/Megatron-LM.git
+    git clone -b ${MEGATRON_BRANCH} https://code.alipay.com/Arc/Megatron-LM.git $(basename ${MEGATRON_PATH})
     popd
 fi
 
