@@ -243,8 +243,8 @@ class Fp8Optimization(Optimization):
         precision_switchable_fp8_input_current_scaling: if use current scaling when use precision_switchable.
         use_te: if True, use te.Linear for fp8 implementation. If False, use atorch ScaledLinear. Default True.
         scale_method: scale method used for ScaledLinear. "tensorwise", "axiswise", "tileblock". default "tensorwise".
-        quantization_method: quantization method used for quantization.  "default", "pytorch", "fbgemm", "triton".
-        compute_method: compute method used for fp8 gemm. "default", "pytorch", "fbgemm", "triton", "cuda".
+        quantization_method: quantization method used for quantization.  "default", "pytorch", "cutlass", "triton".
+        compute_method: compute method used for fp8 gemm. "default", "pytorch", "cutlass", "triton".
         recipe.DelayedScaling's parameter (only applicable when use_te):
             margin: default 0
             interval (te < 1.8): default 1
@@ -340,6 +340,9 @@ class Fp8Optimization(Optimization):
             has_bias = hasattr(module, "bias") and module.bias is not None
             if isinstance(module, torch.nn.Linear):
                 need_copy_weight = True
+                weight_requires_grad = module.weight.requires_grad
+                if has_bias:
+                    bias_requires_grad = module.bias.requires_grad
                 if use_te:
                     if switchable:
                         from atorch.modules.fp8 import PrecisionSwitchableLinear
@@ -381,9 +384,9 @@ class Fp8Optimization(Optimization):
                             scale_method, quantization_method, compute_method, scale_block_size
                         ),
                     )
-                new_module.weight.requires_grad = module.weight.requires_grad
+                new_module.weight.requires_grad = weight_requires_grad
                 if has_bias:
-                    new_module.bias.requires_grad = module.bias.requires_grad
+                    new_module.bias.requires_grad = bias_requires_grad
                 if need_copy_weight:
                     with torch.no_grad():
                         new_module.weight.copy_(module.weight)

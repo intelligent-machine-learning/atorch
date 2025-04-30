@@ -3,8 +3,8 @@ import unittest
 from contextlib import contextmanager
 
 import torch
+from torch.nn import LayerNorm
 
-from atorch.modules.normalization import LayerNorm
 from atorch.utils import AProfiler
 from atorch.utils.prof import GlobalContext, _patch_functionals, _reload_functionals
 
@@ -108,7 +108,6 @@ class TestProfiler(unittest.TestCase):
     )
     def test_patch_functional(self):
         batch_size, nheads, seqlen, headdim = 2, 8, 32, 64
-        from torch.nn import LayerNorm
 
         torch_layer = LayerNorm((seqlen, nheads, headdim))
         with patch_context():

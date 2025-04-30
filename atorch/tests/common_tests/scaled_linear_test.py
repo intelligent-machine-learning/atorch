@@ -4,7 +4,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import atorch
 from atorch.auto.accelerate import auto_accelerate
 from atorch.auto.opt_lib.amp_optimization import is_fp8_available
 from atorch.modules.fp8 import ScaledLinear, get_fp8_module_count, set_linear_modules_precision
@@ -12,8 +11,11 @@ from atorch.modules.fp8.quantize import (
     get_fp8_quantize_underflows,
     get_linear_axiswise_quantize_params,
     get_linear_tileblock_quantize_params,
+    get_quantize_params,
 )
 from atorch.tests.toy_modules.toy_module import ToyDataset, ToyModel, loss_func, optim_func, prepare_input, run_train
+from atorch.utils.import_util import is_deep_gemm_available
+from atorch.utils.version import torch_version
 
 pytestmark = pytest.mark.fp8
 
@@ -83,8 +85,8 @@ def run_scaled_linear(infeatures, outfeatures, batchsize, bias=True, dtype=torch
 
 
 @unittest.skipIf(
-    not torch.cuda.is_available() or not is_fp8_available(),
-    "only on gpu with fp8 supported",
+    not torch.cuda.is_available() or not is_fp8_available() or torch_version() < (2, 5, 0),  # type: ignore
+    "only on gpu with fp8 supported and torch >=2.5",
 )
 class TestScaledLinear(unittest.TestCase):
     def _check_result(self, mse_values):
@@ -122,6 +124,10 @@ class TestScaledLinear(unittest.TestCase):
             self.assertTrue(results["rowwise"] >= results["tilewise"])
         if "blockwise" in results:
             self.assertTrue(results["tensorwise"] >= results["blockwise"])
+        data = torch.rand(128 * 4 - 3, 128 * 4 + 2, device="cuda", dtype=torch.bfloat16)
+        data[0][0] = 10000.0
+        results = get_fp8_quantize_underflows(data)
+        self.assertTrue("tilewise" in results and "blockwise" in results)
 
     def switch_precision(self):
         layer_num = 6
@@ -171,7 +177,7 @@ class TestScaledLinear(unittest.TestCase):
         status, result, _ = auto_accelerate(
             model,
             dataset=dataset,
-            dataloader_args={"batch_size": batch_size},
+            dataloader_args={"batch_size": batch_size, "num_workers": 0},
             prepare_input=prepare_input,
             optim_func=optim_func,
             load_strategy=strategy,
@@ -215,12 +221,22 @@ class TestScaledLinear(unittest.TestCase):
         compute_method = "triton"
         self._run_auto_accelerate_test(scale_method, quantization_method, compute_method)
 
-    @unittest.skipIf(not atorch.modules.fp8.quantize.fbgemm_available, "fbgemm_gpu required")
-    def test_scaled_linear_with_auto_accelerate_with_fbgemm(self):
-        scale_method = "axiswise"
-        quantization_method = "fbgemm"
-        compute_method = "pytorch"
-        self._run_auto_accelerate_test(scale_method, quantization_method, compute_method)
+        from atorch.modules.fp8.cuda_kernel import fp8_cutlass_cublas_ops_available
+
+        if fp8_cutlass_cublas_ops_available():
+            scale_method = "tileblock"
+            quantization_method = "cutlass"
+            compute_method = "cutlass"
+            self._run_auto_accelerate_test(scale_method, quantization_method, compute_method)
+            scale_method = "tileblock"
+            quantization_method = "cublas"
+            compute_method = "cublas"
+            self._run_auto_accelerate_test(scale_method, quantization_method, compute_method)
+            if is_deep_gemm_available():
+                scale_method = "tileblock"
+                quantization_method = "deep_gemm"
+                compute_method = "deep_gemm"
+                self._run_auto_accelerate_test(scale_method, quantization_method, compute_method)
 
     def test_forward(self):
         M, K, N = (512, 1024, 1024)
@@ -229,16 +245,74 @@ class TestScaledLinear(unittest.TestCase):
         input[0][0] *= 100
         input[1][1] = 100
         model = ScaledLinear(K, N, bias=False, device="cuda", dtype=dtype, quantize_params="tensorwise")
-        qparams = get_linear_tileblock_quantize_params(128)
-        model2 = ScaledLinear(K, N, bias=False, device="cuda", dtype=dtype, quantize_params=qparams)
+        tileblock_triton_qparams = get_quantize_params("tileblock", "triton", "triton", 128)
+        tileblock_cutlass_qparams = get_quantize_params("tileblock", "cutlass", "cutlass", 128)
+        tileblock_cublas_qparams = get_quantize_params("tileblock", "cublas", "cublas", 128)
+        model2 = ScaledLinear(K, N, bias=False, device="cuda", dtype=dtype, quantize_params=tileblock_triton_qparams)
+        from atorch.modules.fp8.cuda_kernel import fp8_cutlass_cublas_ops_available
+
+        if fp8_cutlass_cublas_ops_available():
+            model3 = ScaledLinear(
+                K, N, bias=False, device="cuda", dtype=dtype, quantize_params=tileblock_cutlass_qparams
+            )
+            model4 = ScaledLinear(
+                K, N, bias=False, device="cuda", dtype=dtype, quantize_params=tileblock_cublas_qparams
+            )
+            if is_deep_gemm_available():
+                tileblock_deep_gemm_qparams = get_quantize_params("tileblock", "deep_gemm", "deep_gemm", 128)
+                model5 = ScaledLinear(
+                    K, N, bias=False, device="cuda", dtype=dtype, quantize_params=tileblock_deep_gemm_qparams
+                )
+            else:
+                model5 = None
+        else:
+            model3 = None
+            model4 = None
+
         model.set_use_fp8(False)
         with torch.no_grad():
             bf16_res = model(input)
             model.set_use_fp8(True)
             model2.weight.data.copy_(model.weight)  # sync weight
-            # compare tensorwise, tileblockwise results
             tensorwise_res = model(input)
-            tileblock_res = model2(input)
+            tileblock_triton_res = model2(input)
             tensorwise_mse = torch.nn.functional.mse_loss(bf16_res, tensorwise_res)
-            tileblock_mse = torch.nn.functional.mse_loss(bf16_res, tileblock_res)
-            self.assertTrue(tensorwise_mse >= tileblock_mse)
+            tileblock_triton_mse = torch.nn.functional.mse_loss(bf16_res, tileblock_triton_res)
+            self.assertTrue(tensorwise_mse >= tileblock_triton_mse)
+            if model3 is not None:
+                model3.weight.data.copy_(model.weight)
+                tileblock_cutlass_res = model3(input)
+                tileblock_cutlass_mse = torch.nn.functional.mse_loss(bf16_res, tileblock_cutlass_res)
+                self.assertTrue(tensorwise_mse >= tileblock_cutlass_mse)
+            if model4 is not None:
+                model4.weight.data.copy_(model.weight)
+                tileblock_cublas_res = model4(input)
+                tileblock_cublas_mse = torch.nn.functional.mse_loss(bf16_res, tileblock_cublas_res)
+                self.assertTrue(tensorwise_mse >= tileblock_cublas_mse)
+            if model5 is not None:
+                model5.weight.data.copy_(model.weight)
+                tileblock_deep_gemm_res = model5(input)
+                tileblock_deep_gemm_mse = torch.nn.functional.mse_loss(bf16_res, tileblock_deep_gemm_res)
+                self.assertTrue(tensorwise_mse >= tileblock_deep_gemm_mse)
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or not is_fp8_available() or torch_version() < (2, 5, 0),  # type: ignore
+    "only on gpu with fp8 supported and torch >=2.5",
+)
+class TestFp8Kernels(unittest.TestCase):
+    def test_dequant_kernel(self):
+        from atorch.modules.fp8.triton_kernel import block_quant, dequant, tile_quant
+
+        size = 4
+        tensor = torch.ones([128 * size, 128 * size], device="cuda")
+        tensor[1] = 1000
+        tensor[2] = -512
+
+        qx, qs = block_quant(tensor)
+        block_dequant_tensor = dequant(qx, qs)
+
+        qx, qs = tile_quant(tensor)
+        tile_dequant_tensor = dequant(qx, qs)
+
+        self.assertTrue(torch.all(torch.abs(tensor - block_dequant_tensor) >= torch.abs(tensor - tile_dequant_tensor)))

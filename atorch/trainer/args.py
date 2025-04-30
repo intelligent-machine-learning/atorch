@@ -12,6 +12,7 @@ from atorch.trainer.state import AtorchAcceleratorState
 from atorch.trainer.utils import IntervalStrategy
 from atorch.utils.dataclass_utils import AutoMapperExtraConfigs, DataclassMixin, DynamicDataClass
 from atorch.utils.import_util import is_torch_npu_available
+from atorch.utils.version import is_megatron_version_bigger_than
 
 # Attention to developers!!!
 # If you want to add a new mapping to the following dict, you should ensure the arg in AtorchTrainingArgs
@@ -24,13 +25,11 @@ COMMON_TO_MEGATRON_ARG_MAP = {
     "save_steps": "save_interval",
     "logging_steps": "log_interval",
     "eval_steps": "eval_interval",
+    "test_steps": "test_interval",
     "tensorboard_dir": "tensorboard_dir",
-    "manual_gc": "manual_gc",
-    "manual_gc_interval": "manual_gc_interval",
-    "manual_gc_eval": "manual_gc_eval",
-    "profile_step_start": "profile_step_start",
-    "profile_step_end": "profile_step_end",
-    "profile_ranks": "profile_ranks",
+    # "manual_gc": "manual_gc",
+    # "manual_gc_interval": "manual_gc_interval",
+    # "manual_gc_eval": "manual_gc_eval",
     # torch init process
     # Comment the following two lines temporarily.
     # "ddp_backend": "distributed_backend",
@@ -44,8 +43,8 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         default=None,
         metadata={
             "help": 'Select a profiler platform. "hw": torch NPU profiler; "hw_dp": torch NPU dynamic profiler; '
-            '"nv": origin torch profiler.',
-            "choices": [None, "hw", "hw_dp", "nv", "nsys"],
+            '"nv": origin torch profiler; "nv_dp": torch NPU dynamic profiler.',
+            "choices": [None, "hw", "hw_dp", "nv", "nv_dp", "nsys"],
         },
     )
     profiler_file_path: Optional[str] = field(
@@ -60,11 +59,17 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
     profiler_schedule_active: int = field(default=1, metadata={"help": "Torch profiler schedule 'active' arg."})
     profiler_schedule_repeat: int = field(default=1, metadata={"help": "Torch profiler schedule 'repeat' arg."})
     dynamic_profiler_config_path: Optional[str] = field(
-        default=None, metadata={"help": "The config directory when using torch NPU dynamic profiler."}
+        default=None, metadata={"help": "The config directory when using torch dynamic profiler."}
     )
     profile_step_start: int = field(default=10, metadata={"help": "Global step to start profiling."})
     profile_step_end: int = field(default=12, metadata={"help": "Global step to stop profiling."})
-    profile_ranks: List[int] = field(default_factory=lambda: [0], metadata={"help": "Global ranks to profile."})
+    profile_ranks: List[int] = field(default_factory=lambda: [-1], metadata={"help": "Global ranks to profile."})
+    profile_use_gzip: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to save torch profile in gzip format. Only valid when using torch profile on NV GPU."
+        },
+    )
 
     # MindStudio Training Tools: https://gitee.com/ascend/mstt
     msprob_monitor_config_file: Optional[str] = field(
@@ -245,6 +250,13 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
     adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 for AdamW optimizer"})
     adam_epsilon: float = field(default=1e-8, metadata={"help": "Epsilon for AdamW optimizer."})
     max_grad_norm: float = field(default=1.0, metadata={"help": "Max gradient norm."})
+    use_virtual_optimizer: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Whether to use virtual optimizer."
+            "Virtualize optimizer to reduce the number of GPUs required for validating hybrid parallel strategies."
+        },
+    )
 
     safe_serialization: Optional[bool] = field(default=True)
 
@@ -292,6 +304,34 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
                 " evaluation_strategy."
             )
         },
+    )
+
+    # Test
+    test_strategy: Union[IntervalStrategy, str] = field(
+        default="no",
+        metadata={"help": "The test strategy to use."},
+    )
+
+    test_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": ("Run an test every X steps.")},
+    )
+
+    test_delay: Optional[float] = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of epochs or steps to wait for before the first test can be performed, depending on the"
+                " test_strategy."
+            )
+        },
+    )
+
+    test_on_save: bool = field(default=False, metadata={"help": "Whether to do test before saving checkpoint."})
+
+    eval_type: Optional[str] = field(
+        default=None,
+        metadata={"help": 'Evaluation type, "eval" or "test". Private attribution.', "choices": [None, "eval", "test"]},
     )
 
     no_cuda: bool = field(default=False, metadata={"help": "Do not use CUDA even when it is available"})
@@ -384,9 +424,26 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         },
     )
 
+    monitor_total_grad_norm: bool = field(
+        default=False, metadata={"help": "whether monitor grad norm and return this matrix for further control."}
+    )
+
     custom_dpo_infer_function: Optional[Callable] = field(
         default=None,
         metadata={"help": "Custom DPO infer function, necessary when training DPO task."},
+    )
+
+    custom_register_ioc_container: Optional[Callable] = field(
+        default=None,
+    )
+
+    ant_config: dict = field(
+        default_factory=dict, metadata={"help": "Only available if you are using ant internal plugins."}
+    )
+
+    patch_find_nd_overlapping_shards: bool = field(
+        default=False,
+        metadata={"help": "patch _find_nd_overlapping_shards of torch with a cython version defined in ant megatron."},
     )
 
     def validate_megatron_args(self):
@@ -398,6 +455,20 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
                 "megatron and mindspeed support only resume from latest checkpoint, make sure you set the "
                 "resume_from_checkpoint to the out_dir of the checkpoints instead of the iter_XXX subfolder."
             )
+
+        if self.flash_checkpoint:
+            if is_megatron_version_bigger_than("0.6.0", check_equality=False):
+                raise ValueError(
+                    "megatron version > 0.6.0 does not support flash_checkpoint args, please set "
+                    "flash_checkpoint to False and set megatron args 'async_args' to True to use "
+                    "origin async save, or use sync save by only set flash_checkpoint to False."
+                )
+            elif not is_megatron_version_bigger_than("0.6.0"):
+                logger.warning(
+                    "megatron version < 0.6.0 does not support flash_checkpoint args, will automatically"
+                    "switch to sync save mode"
+                )
+                self.flash_checkpoint = False
 
     def __post_init__(self):
         self._megatron_args = None
@@ -436,10 +507,16 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         self.logging_strategy = IntervalStrategy(self.logging_strategy)
         self.save_strategy = IntervalStrategy(self.save_strategy)
         self.evaluation_strategy = IntervalStrategy(self.evaluation_strategy)
+        self.test_strategy = IntervalStrategy(self.test_strategy)
 
         if self.save_strategy == IntervalStrategy.SAMPLES:
             assert self.save_samples is not None, '`save_samples` should be set when using "samples" save_strategy.'
             assert self.save_samples > 0
+
+        if self.save_samples is not None:
+            assert (
+                self.save_strategy == IntervalStrategy.SAMPLES
+            ), '`save_samples` requires `save_strategy` to be "samples".'
 
         if self.save_frequency is not None:
             logger.warning("Please use `extra_save_frequency_in_epoch` instead of `save_frequency`.")
@@ -500,6 +577,10 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
                 f"profiler_type is set to {self.profiler_file_path}, but torch_npu is not available. "
                 "Please check if torch_npu is installed."
             )
+        elif self.profiler_type == "nv":
+            assert self.profiler_file_path is not None, "`profiler_file_path` should be set when profiler_type='nv'."
+            if self.profile_ranks == [-1]:
+                logger.info("torch profiling will be executed on all ranks.")
 
         if self.empty_cache_steps is not None:
             assert self.empty_cache_steps > 0, "`empty_cache_steps` should be greater than 0."
@@ -600,6 +681,10 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         Whether or not this process is the local main process.
         """
         return self.distributed_state.is_local_main_process
+
+    @property
+    def is_last_process(self):
+        return self.distributed_state.is_last_process
 
     @property
     def use_distributed(self):

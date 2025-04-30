@@ -100,7 +100,7 @@ def run_toy_model_with_inspector(
 
 class TestTensorInspector(unittest.TestCase):
     @unittest.skipIf(
-        not torch.cuda.is_available(),
+        not torch.cuda.is_available() or not is_fp8_available(),
         "No gpu available for cuda tests",
     )
     def test_linear_inspector(self):

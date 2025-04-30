@@ -43,7 +43,7 @@ def switch_major(tensor):
 
 
 def _fp8_gemm(fp8_x, fp8_w, x_inverse_scale, w_inverse_scale, bias, out_dtype, quantize_params, method):
-    # FBGEMM uses fp8_weight while PYTORCH method uses fp8_weight_t.
+    # cutlass/triton uses fp8_weight while PYTORCH method uses fp8_weight_t.
     if isinstance(fp8_w, tuple):
         fp8_weight, fp8_weight_t = fp8_w
         weight_inverse_scale, weight_t_inverse_scale = w_inverse_scale
@@ -60,12 +60,20 @@ def _fp8_gemm(fp8_x, fp8_w, x_inverse_scale, w_inverse_scale, bias, out_dtype, q
         return _fp8_gemm_pt(
             fp8_x, fp8_weight_t, x_inverse_scale, weight_t_inverse_scale, bias, out_dtype, quantize_params
         )
-    elif method == ScaleComputMethod.FBGEMM:
-        return _fp8_gemm_fbgemm(
-            fp8_x, fp8_weight, x_inverse_scale, weight_inverse_scale, bias, out_dtype, quantize_params
+    elif method == ScaleComputMethod.CUTLASS or method == ScaleComputMethod.CUBLAS:
+        return _fp8_gemm_cuda(
+            fp8_x,
+            fp8_weight,
+            x_inverse_scale,
+            weight_inverse_scale,
+            bias,
+            out_dtype,
+            use_cublas=method == ScaleComputMethod.CUBLAS,
         )
     elif method == ScaleComputMethod.TRITON:
         return _fp8_gemm_triton(fp8_x, fp8_weight, x_inverse_scale, weight_inverse_scale, bias, out_dtype)
+    elif method == ScaleComputMethod.DEEP_GEMM:
+        return _fp8_gemm_deep_gemm(fp8_x, fp8_weight, x_inverse_scale, weight_inverse_scale, bias, out_dtype)
     else:
         assert 0, f"fp8_gemm method {method} is not implemented yet"
 
@@ -92,30 +100,37 @@ def _fp8_gemm_pt(fp8_x, fp8_w, x_inverse_scale, w_inverse_scale, bias, out_dtype
     return out
 
 
-def _fp8_gemm_fbgemm(fp8_x, fp8_w, x_inverse_scale, w_inverse_scale, bias, out_dtype, quantize_params):
-    assert out_dtype == torch.bfloat16
-    if x_inverse_scale.shape == []:  # tensorwise
-        out = torch.ops.fbgemm.f8f8bf16(
-            fp8_x, fp8_w, x_inverse_scale * w_inverse_scale, use_fast_accum=quantize_params.use_fast_accum
-        )
-    else:  # axiswise
-        out = torch.ops.fbgemm.f8f8bf16_rowwise(
-            fp8_x,
-            fp8_w,
-            x_inverse_scale.view(-1),
-            w_inverse_scale.view(-1),
-            use_fast_accum=quantize_params.use_fast_accum,
-        )
-    if bias is not None:
-        out = out + bias
-    return out
-
-
 def _fp8_gemm_triton(fp8_x, fp8_w, x_inverse_scale, w_inverse_scale, bias, out_dtype):
     # Now only supports x tilewise and w blockwise
     from .triton_kernel import fp8_gemm
 
     out = fp8_gemm(fp8_x, x_inverse_scale, fp8_w, w_inverse_scale, dtype=out_dtype)
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+def _fp8_gemm_deep_gemm(fp8_x, fp8_w, x_inverse_scale, w_inverse_scale, bias, out_dtype):
+    from deep_gemm import gemm_fp8_fp8_bf16_1dx1d, gemm_fp8_fp8_bf16_nt
+
+    m, k = fp8_x.shape
+    n, k_ = fp8_w.shape
+    # x_inverse_scale.shape == (m, (k + 127) // 128)
+    out = torch.empty((m, n), device=fp8_x.device, dtype=out_dtype)
+    if w_inverse_scale.shape == ((n + 127) // 128, (k_ + 127) // 128):  # w is blockwise
+        gemm_fp8_fp8_bf16_nt((fp8_x, x_inverse_scale.t()), (fp8_w, w_inverse_scale), out)
+    else:
+        gemm_fp8_fp8_bf16_1dx1d((fp8_x, x_inverse_scale.t()), (fp8_w, w_inverse_scale.t()), out)
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+def _fp8_gemm_cuda(fp8_x, fp8_w, x_inverse_scale, w_inverse_scale, bias, out_dtype, use_cublas=False):
+    # Now only supports x tilewise and w blockwise
+    from .cuda_kernel import fp8_gemm
+
+    out = fp8_gemm(fp8_x, x_inverse_scale, fp8_w, w_inverse_scale, dtype=out_dtype, use_cublas=use_cublas)
     if bias is not None:
         out = out + bias
     return out
@@ -152,6 +167,8 @@ class _ScaledLinear(torch.autograd.Function):
         saved_input = inputmat if weight.requires_grad else None
         saved_fp8_input = None
         saved_fp8_input_scale = None
+        saved_fp8_input_t = None
+        saved_fp8_input_t_scale = None
         saved_fp8_weight = None
         saved_fp8_weight_scale = None
         saved_fp8_weight_t = None
@@ -177,9 +194,18 @@ class _ScaledLinear(torch.autograd.Function):
                     inputmat, fp8_dtype, dim=1, method=quantize_method
                 )
             elif scale_type == ScaleType.TILEWISE:
-                fp8_input, input_inverse_scale = Fp8Quantization.quantize_tilewise(
-                    inputmat, fp8_dtype, block_size=scale_args, dim=1, method=quantize_method
+                qresult = Fp8Quantization.quantize_tilewise(
+                    inputmat,
+                    fp8_dtype,
+                    block_size=scale_args,
+                    method=quantize_method,
+                    return_transpose=ctx.weight_requires_grad,
                 )
+                if len(qresult) == 2:
+                    fp8_input, input_inverse_scale = qresult
+                else:
+                    fp8_input, input_inverse_scale, saved_fp8_input_t, saved_fp8_input_t_scale = qresult
+                    saved_input = None
             else:
                 assert 0, f"scale type {scale_type} not implemented yet"
 
@@ -202,11 +228,19 @@ class _ScaledLinear(torch.autograd.Function):
                     weight, fp8_dtype, dim=1, method=quantize_method
                 )
             elif scale_type == ScaleType.BLOCKWISE:
-                fp8_weight, weight_inverse_scale = Fp8Quantization.quantize_blockwise(
-                    weight, fp8_dtype, block_size=scale_args, method=quantize_method
+                result = Fp8Quantization.quantize_blockwise(
+                    weight,
+                    fp8_dtype,
+                    block_size=scale_args,
+                    method=quantize_method,
+                    return_transpose=ctx.input_requires_grad,
                 )
-                saved_fp8_weight = fp8_weight
-                saved_fp8_weight_scale = weight_inverse_scale
+                if len(result) == 2:
+                    fp8_weight, weight_inverse_scale = result
+                    saved_fp8_weight = fp8_weight
+                    saved_fp8_weight_scale = weight_inverse_scale
+                else:
+                    fp8_weight, weight_inverse_scale, saved_fp8_weight_t, saved_fp8_weight_t_scale = result
                 saved_weight = None
             else:
                 assert 0, f"scale type {scale_type} not implemented yet"
@@ -236,6 +270,8 @@ class _ScaledLinear(torch.autograd.Function):
             saved_input,
             saved_fp8_input,
             saved_fp8_input_scale,
+            saved_fp8_input_t,
+            saved_fp8_input_t_scale,
             saved_fp8_weight,
             saved_fp8_weight_scale,
             saved_fp8_weight_t,
@@ -255,6 +291,8 @@ class _ScaledLinear(torch.autograd.Function):
             saved_input,
             saved_fp8_input,
             saved_fp8_input_scale,
+            saved_fp8_input_t,
+            saved_fp8_input_t_scale,
             saved_fp8_weight,
             saved_fp8_weight_scale,
             saved_fp8_weight_t,
@@ -270,6 +308,8 @@ class _ScaledLinear(torch.autograd.Function):
 
         computed_fp8_grad = None
         computed_grad_inverse_scale = None
+        fp8_grad_t = None
+        grad_t_inverse_scale = None
 
         if ctx.input_requires_grad:
             # calculate input grad and assign to results[0]
@@ -289,9 +329,17 @@ class _ScaledLinear(torch.autograd.Function):
                         output_grad, fp8_dtype, dim=1, method=quantize_method
                     )
                 elif scale_type == ScaleType.TILEWISE:
-                    fp8_grad, grad_inverse_scale = Fp8Quantization.quantize_tilewise(
-                        output_grad.contiguous(), fp8_dtype, block_size=scale_args, dim=1, method=quantize_method
+                    qresult = Fp8Quantization.quantize_tilewise(
+                        output_grad.contiguous(),
+                        fp8_dtype,
+                        block_size=scale_args,
+                        method=quantize_method,
+                        return_transpose=ctx.weight_requires_grad,
                     )
+                    if len(qresult) == 2:
+                        fp8_grad, grad_inverse_scale = qresult
+                    else:
+                        fp8_grad, grad_inverse_scale, fp8_grad_t, grad_t_inverse_scale = qresult
                 else:
                     assert 0, f"scale type {scale_type} not implemented yet"
 
@@ -309,8 +357,12 @@ class _ScaledLinear(torch.autograd.Function):
                         saved_weight, fp8_dtype, dim=0, method=quantize_method
                     )
                 elif scale_type == ScaleType.BLOCKWISE:
-                    fp8_weight = saved_fp8_weight.t().contiguous()
-                    weight_inverse_scale = saved_fp8_weight_scale.t().contiguous()
+                    if saved_fp8_weight_t is None:
+                        fp8_weight = saved_fp8_weight.t().contiguous()
+                        weight_inverse_scale = saved_fp8_weight_scale.t().contiguous()
+                    else:
+                        fp8_weight = saved_fp8_weight_t
+                        weight_inverse_scale = saved_fp8_weight_t_scale
                 else:
                     assert 0, f"scale type {scale_type} not implemented yet"
 
@@ -348,9 +400,19 @@ class _ScaledLinear(torch.autograd.Function):
                         output_grad.t(), fp8_dtype, dim=1, method=quantize_method
                     )
                 elif scale_type == ScaleType.TILEWISE:
-                    fp8_grad_t, grad_t_inverse_scale = Fp8Quantization.quantize_tilewise(
-                        output_grad.t().contiguous(), fp8_dtype, block_size=scale_args, dim=1, method=quantize_method
-                    )
+                    if fp8_grad_t is None:
+                        qresult = Fp8Quantization.quantize_tilewise(
+                            output_grad.t().contiguous(),
+                            fp8_dtype,
+                            block_size=scale_args,
+                            method=quantize_method,
+                            return_transpose=False,
+                        )
+                        if len(qresult) == 2:
+                            fp8_grad_t, grad_t_inverse_scale = qresult
+                        else:
+                            fp8_grad_t, grad_t_inverse_scale, _, _ = qresult
+
                 else:
                     assert 0, f"scale type {scale_type} not implemented yet"
 
@@ -367,9 +429,21 @@ class _ScaledLinear(torch.autograd.Function):
                         saved_input, fp8_dtype, dim=0, method=quantize_method
                     )
                 elif scale_type == ScaleType.TILEWISE:
-                    fp8_input, input_inverse_scale = Fp8Quantization.quantize_tilewise(
-                        saved_input.t().contiguous(), fp8_dtype, block_size=scale_args, dim=1, method=quantize_method
-                    )
+                    if saved_fp8_input_t is None:
+                        qresult = Fp8Quantization.quantize_tilewise(
+                            saved_input.t().contiguous(),
+                            fp8_dtype,
+                            block_size=scale_args,
+                            method=quantize_method,
+                            return_transpose=False,
+                        )
+                        if len(qresult) == 2:
+                            fp8_input, input_inverse_scale = qresult
+                        else:
+                            fp8_input, input_inverse_scale, _, _ = qresult
+                    else:
+                        fp8_input = saved_fp8_input_t
+                        input_inverse_scale = saved_fp8_input_t_scale
                 else:
                     assert 0, f"scale type {scale_type} not implemented yet"
 

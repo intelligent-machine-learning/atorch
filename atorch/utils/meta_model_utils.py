@@ -175,6 +175,12 @@ def init_empty_weights_with_disk_offload(
         _MetaModeContext.buffer_counter = 0
 
     def register_empty_parameter(module, name, param, *args, **kwargs):
+        # when call load_state_dict,module's param will be overwrite
+        # we should set same checkpoint_name, otherwise ranks will have different checkpoint_name
+        if getattr(module, name, None) is not None:
+            old_chk_name = getattr(module, name, None).checkpoint_name
+        else:
+            old_chk_name = None
         old_register_parameter(module, name, param)
         if hasattr(param, "checkpoint_name"):
             _TIE_DICT[param] = param.checkpoint_name
@@ -182,18 +188,22 @@ def init_empty_weights_with_disk_offload(
             # If ckpt name is not set, set it and wait for offloading,
             # otherwise the param is being reset, directly empty the new values
             if not hasattr(module._parameters[name], "checkpoint_name"):
-                chk_name = get_checkpoint_name(is_param=True)
+                chk_name = old_chk_name or get_checkpoint_name(is_param=True)
                 setattr(module._parameters[name], "checkpoint_name", chk_name)
             else:
                 pass
 
     def register_empty_buffer(module, name, buffer, *args, **kwargs):
+        if getattr(module, name, None) is not None:
+            old_chk_name = getattr(module, name, None).checkpoint_name
+        else:
+            old_chk_name = None
         old_register_buffer(module, name, buffer)
         if hasattr(buffer, "checkpoint_name"):
             _TIE_DICT[buffer] = buffer.checkpoint_name
         if buffer is not None:
             if not hasattr(module._buffers[name], "checkpoint_name"):
-                chk_name = get_checkpoint_name(is_param=False)
+                chk_name = old_chk_name or get_checkpoint_name(is_param=False)
                 setattr(module._buffers[name], "checkpoint_name", chk_name)
             else:
                 pass

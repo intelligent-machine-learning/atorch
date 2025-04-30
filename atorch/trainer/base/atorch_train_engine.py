@@ -1,22 +1,27 @@
 import contextlib
 from abc import abstractmethod
+from pathlib import Path
+from typing import Optional
 
 import torch.nn
 from accelerate.state import GradientState
 from torch.utils.data import DataLoader
-from transformers.trainer_callback import TrainerState
 
 from atorch.trainer.args import AtorchTrainingArgs
-from atorch.utils.dev_utils import raise_not_impl
+from atorch.trainer.trainer_callback import AtorchTrainerState
 
 
 class AtorchTrainEngine(torch.nn.Module):
-    def __init__(self, train_args):
+    def __init__(
+        self,
+        train_args,
+        train_state: AtorchTrainerState,
+    ):
         super().__init__()
 
         self.train_args: AtorchTrainingArgs = train_args
         self.gradient_state = GradientState()
-        self.train_state = TrainerState()
+        self.train_state = train_state
         self.pytorch_model = None
 
     @staticmethod
@@ -70,21 +75,27 @@ class AtorchTrainEngine(torch.nn.Module):
     def eval_step(self, **batch_data):
         pass
 
-    def save_checkpoint(self, output_dir, trainer_state: dict = None, **kwargs):
-        raise NotImplementedError("Subclass should implement this method.")
+    @abstractmethod
+    def save_checkpoint(self, output_dir: Optional[Path], best_model_checkpoint=None, **kwargs):
+        """
 
-    def get_checkpoint_path_dir(self, output_dir, **kwargs):
-        raise NotImplementedError("Subclass should implement this method.")
+        Args:
+            output_dir:
+            train_state:
+            best_model_checkpoint: designed from TrainState.best_model_checkpoint, could be a folder path as str.
+            **kwargs:
 
-    def load_checkpoint(self, input_dir, **kwargs):
-        raise NotImplementedError("Subclass should implement this method.")
+        Returns:
 
-    @raise_not_impl
-    def save(self, output_dir, train_args):
+        """
         pass
 
-    @raise_not_impl
-    def load(self, input_dir, **load_model_func_kwargs):
+    @abstractmethod
+    def get_checkpoint_iteration_path_dir(self, output_dir: Optional[Path], **kwargs) -> Path:
+        pass
+
+    @abstractmethod
+    def load_checkpoint(self, resume_from_ckpt: Optional[Path], model, optimizer=None, scheduler=None, **kwargs):
         pass
 
     def training_log(self, **kwargs):

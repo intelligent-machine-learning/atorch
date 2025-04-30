@@ -6,30 +6,40 @@ import math
 import os
 import random
 import sys
-from typing import Dict, List, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
 import torch.distributed
+from dependency_injector.wiring import Provide, inject
 from torch.utils.data import DataLoader
+from transformers.trainer import TRAINER_STATE_NAME
 
 from atorch.common.log_utils import default_logger as logger
 from atorch.trainer.args import AtorchTrainingArgs
+from atorch.trainer.base.atorch_container import AtorchTrainerContainer
 from atorch.trainer.base.atorch_train_engine import AtorchTrainEngine
+from atorch.trainer.megatron.megatron_ckpt_loader import MegatronCkptLoader
+from atorch.trainer.megatron.megatron_ckpt_saver import MegatronCkptSaver
 from atorch.trainer.megatron.megatron_dataloader import (
     AtorchMegatronDataloader,
     _prepare_megaton_dataloader,
     wrap_megatron_dataloader,
 )
 from atorch.trainer.megatron.megatron_train_step import BertTrainStep, GPTTrainStep, MegatronTrainStep, T5TrainStep
+from atorch.trainer.trainer_callback import AtorchTrainerState
 from atorch.trainer.utils import (
     broadcast_spike_loss_ratio_in_pp_group,
     calc_params_std,
-    is_main_process,
+    count_zeros_in_grad,
+    get_grad_norm_in_optimizer,
     scale_main_grad_for_spike_loss,
     training_log,
 )
 from atorch.utils.import_util import is_megatron_lm_available, is_torch_npu_available
+from atorch.utils.version import is_megatron_version_bigger_than
+from atorch.utils.virtual_optimizer.megatron_virtual_optimizer import get_megatron_virtual_optimizer
 
 if is_megatron_lm_available():
     from megatron.core import mpu, tensor_parallel
@@ -49,7 +59,7 @@ if is_megatron_lm_available():
     except ImportError:
         from megatron.core.num_microbatches_calculator import get_num_microbatches, update_num_microbatches
     from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-    from megatron.training.checkpointing import get_checkpoint_name, load_args_from_checkpoint
+    from megatron.training.checkpointing import load_args_from_checkpoint
     from megatron.training.global_vars import get_timers, set_global_variables
     from megatron.training.initialize import (
         _compile_dependencies,
@@ -111,6 +121,33 @@ def initialize_megatron(
                 )
         # TODO: extra key.
         setattr(args, key, value)
+
+    if use_deterministic_algorithms:
+        # Megatron's `deterministic_mode` arg is introduced after core_0.8.0 version.
+        if is_megatron_version_bigger_than("0.8.0"):
+            args.deterministic_mode = True
+            args.use_flash_attn = False
+            args.cross_entropy_loss_fusion = False
+
+        if not is_torch_npu_available():
+            # On GPU env, bias_dropout_fusion will effect the accuracy of loss and grad when resuming
+            # training from a checkpoint. So if you want to use deterministic algorithms, set it to False.
+            args.bias_dropout_fusion = False
+
+        # Set env variables about deterministic mode
+        if os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1") != "0":
+            logger.info("For deterministic algo, env [NVTE_ALLOW_NONDETERMINISTIC_ALGO] will be set to '0'.")
+            os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+
+        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
+        if os.getenv("NCCL_ALGO") not in all_reduce_choices:
+            logger.info("For deterministic algo, env [NCCL_ALGO] will be set to 'Ring'.")
+            os.environ["NCCL_ALGO"] = "Ring"
+
+        cublas_workspace_config_choices = [":4096:8", ":16:8"]
+        if os.getenv("CUBLAS_WORKSPACE_CONFIG") not in cublas_workspace_config_choices:
+            logger.info("For deterministic algo, env [CUBLAS_WORKSPACE_CONFIG] will be set to ':4096:8'.")
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     device_count = torch.cuda.device_count()
     args.local_rank = torch.distributed.get_rank() % device_count
@@ -178,7 +215,7 @@ def initialize_megatron(
         return None
 
 
-def prepare_optimizer(args, megatron_args, model):
+def prepare_optimizer(train_args, args, megatron_args, model):
     logger.info("Preparing optimizer")
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
@@ -186,6 +223,7 @@ def prepare_optimizer(args, megatron_args, model):
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = get_timers()
+    # NOTE use_local_sgd should be injected with local_sgd_arg_provider
     if hasattr(args, "use_local_sgd") and args.use_local_sgd:
         from atorch.local_sgd.configs import GTAConfig, LocalSGDConfig, OuterOptimizerConfig
         from atorch.local_sgd.megatron import get_megatron_optimizer
@@ -229,15 +267,25 @@ def prepare_optimizer(args, megatron_args, model):
             gta_config=gta_config,
         )
     else:
-        from megatron.core.optimizer import get_megatron_optimizer
+        if train_args.use_virtual_optimizer:
+            return get_megatron_virtual_optimizer(
+                train_args,
+                config,
+                model,
+                megatron_args.no_wd_decay_cond,
+                megatron_args.scale_lr_cond,
+                megatron_args.lr_mult,
+            )
+        else:
+            from megatron.core.optimizer import get_megatron_optimizer
 
-        return get_megatron_optimizer(
-            config,
-            model,
-            megatron_args.no_wd_decay_cond,
-            megatron_args.scale_lr_cond,
-            megatron_args.lr_mult,
-        )
+            return get_megatron_optimizer(
+                config,
+                model,
+                megatron_args.no_wd_decay_cond,
+                megatron_args.scale_lr_cond,
+                megatron_args.lr_mult,
+            )
 
 
 def model_provider_func(pre_process=True, post_process=True, add_encoder=True, add_decoder=True):
@@ -294,28 +342,37 @@ def model_provider_func(pre_process=True, post_process=True, add_encoder=True, a
 
 
 class AtorchMegatronEngine(AtorchTrainEngine):
+    @inject
     def __init__(
         self,
         train_args: AtorchTrainingArgs,
-        model: MegatronModule,
-        optimizer: MegatronOptimizer,
-        scheduler: OptimizerParamScheduler,
+        # model: MegatronModule,
+        # optimizer: MegatronOptimizer,
+        # scheduler: OptimizerParamScheduler,
         dataloaders: Union[AtorchMegatronDataloader, tuple, None],
+        train_state: AtorchTrainerState,
+        ckpt_saver: MegatronCkptSaver = Provide[AtorchTrainerContainer.ckpt_saver],
+        ckpt_loader: MegatronCkptLoader = Provide[AtorchTrainerContainer.ckpt_loader],
         resume_from_checkpoint: str = None,
         **kwargs,
     ):
-        super().__init__(train_args)
+        super().__init__(train_args, train_state)
 
         self.module: List[MegatronModule]
         self.optimizer: MegatronOptimizer
         self.scheduler: OptimizerParamScheduler
         self.dataloaders = dataloaders
 
+        self.ckpt_saver: MegatronCkptSaver = ckpt_saver
+        self.ckpt_loader: MegatronCkptLoader = ckpt_loader
+
         self._dataloaders: List[DataLoader] = []
 
         self.megatron_args = train_args.megatron_args()
 
         self.initialize(self.megatron_args, self.train_args.use_deterministic_algorithms)
+
+        self.num_floating_point_operations_since_last_log_event = 0.0
 
         self._validate_train_args()
 
@@ -348,6 +405,19 @@ class AtorchMegatronEngine(AtorchTrainEngine):
             self.build_dataloader()
 
         # This invoking must be executed when initializing megatron has been down.
+        if getattr(args, "swap_attention", None):
+            try:
+                from mindspeed.core.memory.adaptive_recomputing.adaptive_recompute import (
+                    setup_model_and_optimizer_wrapper,
+                )
+
+                setattr(
+                    AtorchMegatronEngine,
+                    "prepare_model_optimizer_scheduler",
+                    setup_model_and_optimizer_wrapper(AtorchMegatronEngine.prepare_model_optimizer_scheduler),
+                )
+            except Exception:
+                raise ValueError("not support swap_attention")
         (
             self.module,
             self.optimizer,
@@ -358,20 +428,32 @@ class AtorchMegatronEngine(AtorchTrainEngine):
             from megatron.training.checkpointing import save_checkpoint
 
             args.save = self.train_args.output_dir_for_converting
-            args.no_save_optim = True
-            args.no_save_rng = True
+            args.async_save = False  # asynchronous save is not supported when converting checkpoint
 
-            # TODO: consider async saving
-            assert args.ckpt_format == "torch_dist", "Only support to convert torch bin to torch_dist, so you must set "
-            assert args.iteration == 0, "Only support finetune from 0th-step checkpoint."
+            if is_megatron_version_bigger_than("0.9.0"):
+                from megatron.training.utils import update_use_dist_ckpt
 
-            save_checkpoint(
-                args.iteration,
-                self.module,
-                None,
-                None,
-                num_floating_point_operations_so_far=args.num_floating_point_operations_so_far,
-            )
+                update_use_dist_ckpt(args)
+
+            if is_megatron_version_bigger_than("0.10.0"):
+                from megatron.training.training import preprocess_common_state_dict
+
+                save_checkpoint(
+                    args.iteration,
+                    self.module,
+                    self.optimizer,
+                    self.scheduler,
+                    num_floating_point_operations_so_far=args.num_floating_point_operations_so_far,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                )
+            else:
+                save_checkpoint(
+                    args.iteration,
+                    self.module,
+                    self.optimizer,
+                    self.scheduler,
+                    num_floating_point_operations_so_far=args.num_floating_point_operations_so_far,
+                )
 
             torch.distributed.barrier()
 
@@ -457,17 +539,20 @@ class AtorchMegatronEngine(AtorchTrainEngine):
         self.train_args.per_device_eval_batch_size = args.micro_batch_size * get_num_microbatches()
 
         if args.profile:
-            if is_torch_npu_available():
-                logger.warning("nsys profiling is not supported on NPU env.")
-            else:
-                if self.train_args.profiler_type is None:
-                    self.train_args.profiler_type = "nsys"
-                elif self.train_args.profiler_type != "nsys":
-                    raise ValueError(
-                        f"Can't use {self.train_args.profiler_type} and nsys to profile "
-                        "simultaneously. You can set atorch trainer's 'profiler_type' arg "
-                        "to 'nsys' or not set Megatron's 'profile' arg."
-                    )
+            raise ValueError(
+                "Please set atorch trainer's 'profiler_type' arg, megatron profiler is disabled by" "atorch trainer."
+            )
+            # if is_torch_npu_available():
+            #     logger.warning("nsys profiling is not supported on NPU env.")
+            # else:
+            #     if self.train_args.profiler_type is None:
+            #         self.train_args.profiler_type = "nsys"
+            #     elif self.train_args.profiler_type != "nsys":
+            #         raise ValueError(
+            #             f"Can't use {self.train_args.profiler_type} and nsys to profile "
+            #             "simultaneously. You can set atorch trainer's 'profiler_type' arg "
+            #             "to 'nsys' or not set Megatron's 'profile' arg."
+            #         )
 
         def _assert(condition, arg_name):
             assert condition, f"{arg_name} is not supported in AtorchTrainer."
@@ -478,6 +563,9 @@ class AtorchMegatronEngine(AtorchTrainEngine):
         _assert(args.exit_duration_in_mins is None, "exit_duration_in_mins")
         _assert(args.exit_interval is None, "exit_interval")
         _assert(not args.vision_pretraining, "vision_pretraining")
+        assert (
+            args.ckpt_convert_format is None
+        ), "'ckpt_convert_format' is not supported in AtorchTrainer, please use AtorchTrainer's 'convert_checkpoint' instead."  # noqa E501
 
     @staticmethod
     def initialize(megatron_args, use_deterministic_algorithms=False):  # todo type  type: ignore[override]
@@ -497,11 +585,25 @@ class AtorchMegatronEngine(AtorchTrainEngine):
             if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10):
                 torch._C._jit_set_nvfuser_enabled(False)
 
-            args = get_args()
-            if not is_torch_npu_available() and args.bias_dropout_fusion:
-                # On GPU env, bias_dropout_fusion will effect the accuracy of loss and grad when resuming
-                # training from a checkpoint. So if you want to use deterministic algorithms, set it to False.
-                raise ValueError("You should set 'bias_dropout_fusion' to False when using deterministic algorithm.")
+    def post_training_step(self):
+        try:
+            from megatron.training.training import post_training_step_callbacks
+
+            post_training_step_callbacks(
+                model=self.module,
+                optimizer=self.optimizer,
+                opt_param_scheduler=self.scheduler,
+                iteration=self.iteration,
+                prof=None,
+                num_floating_point_operations_since_last_log_event=self.num_floating_point_operations_since_last_log_event,  # noqa E501
+            )
+
+            megatron_args = get_args()
+            if self.iteration % megatron_args.log_interval == 0 and megatron_args.log_straggler:
+                self.num_floating_point_operations_since_last_log_event = 0.0
+
+        except ImportError:
+            pass
 
     def prepare_model_optimizer_scheduler(self, resume_from_checkpoint=None):
         logger.info("Preparing model optimizer scheduler")
@@ -523,6 +625,7 @@ class AtorchMegatronEngine(AtorchTrainEngine):
                 model_provider_func_ = megatron_args.custom_model_provider_function
             else:
                 model_provider_func_ = model_provider_func
+            # NOTE similar to get optimizer, hack here, and need to verify the existance of use_local_sgd
             if hasattr(args, "use_local_sgd") and args.use_local_sgd:
                 from atorch.local_sgd.megatron import get_model
 
@@ -532,15 +635,17 @@ class AtorchMegatronEngine(AtorchTrainEngine):
 
                 model = get_model(model_provider_func_, model_type)
 
-        optimizer = prepare_optimizer(args, megatron_args, model)
+        optimizer = prepare_optimizer(self.train_args, args, megatron_args, model)
         scheduler = get_optimizer_param_scheduler(optimizer)
 
         if resume_from_checkpoint is not None:
             timers("load-checkpoint", log_level=0).start(barrier=True)
 
+            if isinstance(resume_from_checkpoint, str):
+                resume_from_checkpoint = Path(resume_from_checkpoint)
             (args.iteration, args.num_floating_point_operations_so_far,) = self.load_checkpoint(
-                input_dir=resume_from_checkpoint,
-                module=model,
+                resume_from_ckpt=resume_from_checkpoint,
+                model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
             )
@@ -639,14 +744,26 @@ class AtorchMegatronEngine(AtorchTrainEngine):
             ) = _build_dataloader()
         timers("train/valid/test-data-iterators-setup").stop()
 
-        is_finetune = self.train_args.finetune_type is not None
+        is_post_training = self.train_args.finetune_type is not None
 
-        self._dataloaders.append(wrap_megatron_dataloader(train_data_iterator, is_finetune))
-        self._dataloaders.append(wrap_megatron_dataloader(valid_data_iterator, is_finetune))
-        self._dataloaders.append(wrap_megatron_dataloader(test_data_iterator, is_finetune))
+        if is_post_training:
+            # In post-training scene, we need to calculate how many global steps are required to iterate through the
+            # dataloader. Batch size warmup will increase the complexity of calculating the steps, so we don't consider
+            # batch size warmup in post-training scene.
+            assert args.rampup_batch_size is None, "rampup_batch_size is not supported in post-training."
+
+        self._dataloaders.append(
+            wrap_megatron_dataloader(train_data_iterator, dataset_type="train", is_post_training=is_post_training)
+        )
+        self._dataloaders.append(
+            wrap_megatron_dataloader(valid_data_iterator, dataset_type="eval", is_post_training=is_post_training)
+        )
+        self._dataloaders.append(
+            wrap_megatron_dataloader(test_data_iterator, dataset_type="test", is_post_training=is_post_training)
+        )
 
         # Calculate train_iters
-        if is_finetune:
+        if is_post_training:
             train_dataloader = self._dataloaders[0]
             num_update_steps_per_epoch = len(train_dataloader)
 
@@ -738,6 +855,7 @@ class AtorchMegatronEngine(AtorchTrainEngine):
         args = get_args()
 
         if self.module[0].training:
+            args.forward_mode = "train"
             # Update number of microbatches first without consistency. Then run consistency check
             # to make sure training configuration is still valid.
             update_num_microbatches(args.consumed_train_samples, consistency_check=False)
@@ -747,14 +865,16 @@ class AtorchMegatronEngine(AtorchTrainEngine):
                 ), "number of microbatches should be increasing due to batch size rampup"
             self.num_microbatches = get_num_microbatches()
             update_num_microbatches(args.consumed_train_samples, consistency_check=True)
-
+            args.curr_iteration = self.iteration
             loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = self.train_step(data_iterator)
 
             self.iteration += 1
             args.global_step = self.iteration
             batch_size = mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
             args.consumed_train_samples += batch_size
-            self.num_floating_point_operations_so_far += num_floating_point_operations(args, batch_size)
+            num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
+            self.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
+            self.num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
             loss_scale = self.optimizer.get_loss_scale().item()
             params_norm = None
@@ -793,8 +913,16 @@ class AtorchMegatronEngine(AtorchTrainEngine):
                 custom_training_log_dict,
             ]
         else:
+            # Set evaluation type, which belongs to ["eval", "test"]
+            args.forward_mode = self.train_args.eval_type
             loss_dict = self.eval_step(data_iterator)
             for key, value in loss_dict.items():
+                if self.train_args.eval_type == "eval":
+                    key = f"{key} validation"
+                elif self.train_args.eval_type == "test":
+                    key = f"{key} test"
+                else:
+                    logger.warning(f"Unexpected evaluation type {self.train_args.eval_type}")
                 self.eval_total_loss_dict[key] = (
                     self.eval_total_loss_dict.get(key, torch.FloatTensor([0.0]).cuda()) + value
                 )
@@ -861,6 +989,7 @@ class AtorchMegatronEngine(AtorchTrainEngine):
 
         # Forward pass.
         forward_backward_func = get_forward_backward_func()
+        # losses_reduced: A list of loss whose length equals to the number of microbatches.
         losses_reduced = forward_backward_func(
             forward_step_func=self.train_step_handler.get_forward_step_func(),
             data_iterator=data_iterator,
@@ -872,21 +1001,44 @@ class AtorchMegatronEngine(AtorchTrainEngine):
             forward_only=False,
         )
 
-        loss_processed = self.train_step_handler.loss_postprocessing(losses_reduced)
+        total_grad_norm = None
 
-        # Compat previous-version loss_postprocessing()
-        if isinstance(loss_processed, tuple):
-            assert len(loss_processed) == 2
-            loss_to_log, spike_loss_ratio = loss_processed
+        if self.train_args.monitor_total_grad_norm:
+            total_grad_norm = get_grad_norm_in_optimizer(self.optimizer)
+
+        monitored_dict = {"losses_reduced": losses_reduced, "total_grad_norm": total_grad_norm}
+
+        loss_postprocessed = self.train_step_handler.loss_postprocessing(monitored_dict)
+
+        if isinstance(loss_postprocessed, dict):
+            if "loss_to_log" in loss_postprocessed:
+                assert (
+                    "spike_loss_ratio" in loss_postprocessed
+                ), f"'spike_loss_ratio' should be in return value of {type(self.train_step_handler)}::loss_postprocessing()."  # noqa E501
+                loss_to_log = loss_postprocessed["loss_to_log"]
+                spike_loss_ratio = loss_postprocessed["spike_loss_ratio"]
+            else:  # compat atorch version before 1.6.1rc8
+                loss_to_log = loss_postprocessed
+                spike_loss_ratio = None
+        elif isinstance(loss_postprocessed, tuple):  # compat atorch version before 1.6.1rc8
+            assert len(loss_postprocessed) == 2
+            loss_to_log, spike_loss_ratio = loss_postprocessed
         else:
-            loss_to_log = loss_processed
-            spike_loss_ratio = None
+            raise ValueError(
+                f"Unexpected return value type of {type(self.train_step_handler)}::loss_postprocessing()."
+                f" Please use dict to wrap return value of the loss_postprocessing method."
+            )
 
         spike_loss_ratio = broadcast_spike_loss_ratio_in_pp_group(spike_loss_ratio)
 
         if spike_loss_ratio is not None:
             logger.info(f"[Rank {torch.distributed.get_rank()}] apply spike loss on grad with ratio {spike_loss_ratio}")
-            scale_main_grad_for_spike_loss(self.module, spike_loss_ratio, self.train_args.log_grad_diff_for_debug)
+            scale_main_grad_for_spike_loss(
+                self.module,
+                spike_loss_ratio,
+                self.train_args.log_grad_diff_for_debug,
+                self.optimizer,
+            )
 
         # Empty unused memory.
         if args.empty_unused_memory_level >= 1:
@@ -896,7 +1048,9 @@ class AtorchMegatronEngine(AtorchTrainEngine):
         timers("optimizer", log_level=1).start(barrier=args.barrier_with_L1_time)
         if spike_loss_ratio == 0.0:
             logger.info(f"[Rank {torch.distributed.get_rank()}] spike loss ratio is 0, skip optimizer.step()")
-            update_successful, grad_norm, num_zeros_in_grad = (False, None, None)
+            update_successful = False
+            grad_norm = get_grad_norm_in_optimizer(self.optimizer) if total_grad_norm is None else total_grad_norm
+            num_zeros_in_grad = count_zeros_in_grad(self.optimizer) if args.log_num_zeros_in_grad else None
         else:
             update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
         timers("optimizer").stop()
@@ -925,10 +1079,10 @@ class AtorchMegatronEngine(AtorchTrainEngine):
 
         args = get_args()
 
-        # batch_data_iterator = self.get_batch_data_iterator(batch_data)
         forward_backward_func = get_forward_backward_func()
         # Don't care about timing during evaluation
         self.module_config.timers = None
+        # loss_dicts: A list of loss whose length equals to the number of microbatches.
         loss_dicts = forward_backward_func(
             forward_step_func=self.train_step_handler.get_forward_step_func(),
             data_iterator=data_iterator,
@@ -944,21 +1098,31 @@ class AtorchMegatronEngine(AtorchTrainEngine):
         if args.empty_unused_memory_level >= 1:
             torch.cuda.empty_cache()
 
+        monitored_dict = {"losses_reduced": loss_dicts}
+
+        try:
+            loss_postprocessed = self.train_step_handler.loss_postprocessing(monitored_dict)
+
+            assert (
+                "loss_to_log" in loss_postprocessed
+            ), f"'loss_to_log' should be in return value of {type(self.train_step_handler)}::loss_postprocessing()."
+
+            loss_to_log = loss_postprocessed["loss_to_log"]
+        except Exception as e:
+            # Compat old loss postprocessing method
+            if self.train_args.is_last_process:
+                logger.warning(f" {type(e).__name__} {e}")
+                logger.warning(
+                    f"Can't get eval loss from {type(self.train_step_handler)}::loss_postprocessing(),"
+                    f" please upgrade your {type(self.train_step_handler)}::loss_postprocessing() function!"
+                )
+            loss_to_log = self.train_step_handler.validation_loss_postprocessing(loss_dicts)
+
         args.consumed_valid_samples += (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )
 
-        if mpu.is_pipeline_last_stage(ignore_virtual=True):
-            # Average loss across microbatches.
-            loss_reduced = {}
-            for key in loss_dicts[0]:
-                losses_reduced_for_key = [x[key] for x in loss_dicts]
-                if len(losses_reduced_for_key[0].shape) == 0:
-                    loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-                else:
-                    loss_reduced[key] = torch.concat(losses_reduced_for_key)
-            return loss_reduced
-        return {}
+        return loss_to_log
 
     def log_eval_results(self):
         args = get_args()
@@ -966,7 +1130,7 @@ class AtorchMegatronEngine(AtorchTrainEngine):
             return
         args = get_args()
         writer = get_tensorboard_writer()
-        string = f"validation loss at iteration {self.iteration} | "
+        string = f"validation/test loss at iteration {self.iteration} | "
         for key, value in self.eval_total_loss_dict.items():
             if key.endswith("_num_iters") or torch.numel(value) > 1:
                 continue
@@ -976,112 +1140,87 @@ class AtorchMegatronEngine(AtorchTrainEngine):
             if args.pretraining_flag:
                 string += f"{key} PPL: {ppl} | "
             if writer:
-                writer.add_scalar(f"{key} validation", value.item(), self.iteration)
+                if not key.endswith("validation") and not key.endswith("test"):
+                    key = key + " validation"
+                writer.add_scalar(f"{key}", value.item(), self.iteration)
                 if args.pretraining_flag:
-                    writer.add_scalar(f"{key} validation ppl", ppl, self.iteration)
+                    writer.add_scalar(f"{key} ppl", ppl, self.iteration)
 
         length = len(string) + 1
-        print_rank_last("-" * length)
+        print_rank_last("-" * min(length, 150))
         print_rank_last(string)
-        print_rank_last("-" * length)
+        print_rank_last("-" * min(length, 150))
         self.eval_total_loss_dict = {}
 
     def training_log(self, **kwargs) -> Dict:
         if self.training_log_args is not None:
             self.report_memory_flag, logging_metrics = training_log(*self.training_log_args)
+            # To ensure only once call in a step, set self.training_log_args to None
+            self.training_log_args = None
             return logging_metrics
         return {}
 
     def save_checkpoint(
         self,
-        output_dir=None,
-        trainer_state: dict = None,
+        output_dir: Optional[Path] = None,
         best_model_checkpoint=None,
         **kwargs,
     ):
-        self.log_eval_results()
+        self.ckpt_saver.save(
+            iteration=self.iteration,
+            output_dir=str(output_dir),
+            train_args=self.train_args,
+            module=self.module,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            num_floating_point_operations_so_far=self.num_floating_point_operations_so_far,
+            best_model_checkpoint=best_model_checkpoint,
+        )
+
+        if self.train_args.is_main_process:
+            checkpoint_dir_path = self.get_checkpoint_iteration_path_dir(None, return_base_dir=True)
+
+            self.train_state.save_to_json(str(checkpoint_dir_path.joinpath(TRAINER_STATE_NAME)))
+
+    def get_checkpoint_iteration_path_dir(self, output_dir: Optional[Path], **kwargs) -> Path:
+        """
+        this function will return the real ckpt save iteration folder path, and make sure the main process will
+        generate the folder.
+        Args:
+            output_dir: the output_dir from the config. If None, will get from megatron args().save
+            **kwargs:
+
+        Returns:
+            the real ckpt save iteration folder path
+
+        """
+        args = get_args()
+        output_dir = output_dir or Path(args.save)
+        kwargs["return_base_dir"] = True
+        checkpoint_name = self.ckpt_saver.get_interation_path(
+            output_dir=str(output_dir), iteration=self.iteration, **kwargs
+        )
+        if self.train_args.is_main_process:
+            os.makedirs(checkpoint_name, exist_ok=True)
+
+        return Path(checkpoint_name)
+
+    def load_checkpoint(self, resume_from_ckpt: Optional[Path], model, optimizer=None, scheduler=None, **kwargs):
         args = get_args()
 
-        if self.train_args.flash_checkpoint:
-            from dlrover.trainer.torch.flash_checkpoint.megatron_async_save.megatron_async_torch_save import (
-                save_checkpoint,
-            )
+        if resume_from_ckpt is not None:
+            args.load = str(resume_from_ckpt)
 
-            save_checkpoint(
-                self.iteration,
-                self.module,
-                self.optimizer,
-                self.scheduler,
-                num_floating_point_operations_so_far=self.num_floating_point_operations_so_far,
-                timeout=self.train_args.flash_checkpoint_timeout,
-            )
+        iteration, num_floating_point_operations_so_far = self.ckpt_loader.load(
+            model=model, optimizer=optimizer, scheduler=scheduler, train_args=self.train_args
+        )
 
-            from atorch.trainer.base.checkpoint import _rotate_checkpoints
+        self.iteration = iteration
 
-            ckpt_save_total_limit = (
-                None if self.train_args.save_total_limit is None else self.train_args.save_total_limit + 2
-            )
+        if iteration > 0:  # not finetune, continue pretrain
+            trainer_state_path = self.get_checkpoint_iteration_path_dir(output_dir=get_args().load)
+            AtorchTrainerState.load_from_json(str(trainer_state_path.joinpath(TRAINER_STATE_NAME)), self.train_state)
 
-            if is_main_process():
-                _rotate_checkpoints(
-                    output_dir=output_dir,
-                    save_total_limit=ckpt_save_total_limit,
-                    best_model_checkpoint=best_model_checkpoint,
-                )
-
-            torch.distributed.barrier()
-
-            # ais will handle the ckpt rotate deletion.
-        else:  # save locally sync mode
-            checkpoint_dir_path = self.get_checkpoint_path_dir(args.save, return_base_dir=True)
-
-            if is_main_process():
-                os.makedirs(checkpoint_dir_path, exist_ok=True)
-
-            torch.distributed.barrier()
-
-            from megatron.training.checkpointing import save_checkpoint
-
-            save_checkpoint(
-                self.iteration,
-                self.module,
-                self.optimizer,
-                self.scheduler,
-                num_floating_point_operations_so_far=self.num_floating_point_operations_so_far,
-            )
-
-            torch.distributed.barrier()
-
-            from atorch.trainer.base.checkpoint import _rotate_checkpoints
-
-            if is_main_process():
-                _rotate_checkpoints(
-                    output_dir=output_dir,
-                    save_total_limit=self.train_args.save_total_limit,
-                    best_model_checkpoint=best_model_checkpoint,
-                )
-
-        torch.distributed.barrier()
-
-    def get_checkpoint_path_dir(self, output_dir, **kwargs):
-        args = get_args()
-        checkpoint_name = get_checkpoint_name(args.save, self.iteration, **kwargs)
-        return checkpoint_name
-        # return os.path.dirname(checkpoint_name)
-
-    def load_checkpoint(self, input_dir, module, optimizer, scheduler, **kwargs):
-        args = get_args()
-        args.load = input_dir
-        args.consumed_train_samples = 0
-        args.consumed_valid_samples = 0
-
-        torch.distributed.barrier()
-
-        # we decide to use sync load for all case
-        from megatron.training.checkpointing import load_checkpoint
-
-        iteration, num_floating_point_operations_so_far = load_checkpoint(module, optimizer, scheduler)
-        torch.distributed.barrier()
         return iteration, num_floating_point_operations_so_far
 
     def optimizer_step(self):

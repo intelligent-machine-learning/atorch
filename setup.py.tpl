@@ -203,12 +203,12 @@ setup(
     " large-scale pretraining and finetuning of LLMs with over 100 billion parameters and"
     " thousands of advanced GPUs.",
     author="Ant Group",
-    url="https://github.com/intelligent-machine-learning/atorch",
+    url="https://github.com/intelligent-machine-learning/dlrover/tree/master/atorch",
     python_requires=">=3.8",
     packages=find_packages(exclude=["*test*", "benchmarks*"]),
     install_requires=required_deps,
     package_data={"": ["*.so"], "atorch": package_data},
     ext_modules=ext_modules,
     cmdclass=cmdclass,
-    data_files=["atorch/requirements.txt", "dev/scripts/build_proto.sh"] + proto_files,
+    data_files=["atorch/requirements.txt"] + proto_files,
 )

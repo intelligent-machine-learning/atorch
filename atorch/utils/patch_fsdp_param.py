@@ -11,10 +11,16 @@ from atorch.utils.version import torch_version
 _FSDP2_PATCH_TORCH_VERSION = (2, 5, 0)
 
 if torch_version() >= _FSDP2_PATCH_TORCH_VERSION:  # type: ignore
-    from torch.distributed._composable.fsdp import _fsdp_init
-    from torch.distributed._composable.fsdp._fsdp_param import FSDPParam
-    from torch.distributed._composable.fsdp._fsdp_param_group import FSDPParamGroup
-    from torch.distributed._composable.fsdp._fsdp_state import FSDPState
+    try:
+        from torch.distributed._composable.fsdp import _fsdp_init
+        from torch.distributed._composable.fsdp._fsdp_param import FSDPParam
+        from torch.distributed._composable.fsdp._fsdp_param_group import FSDPParamGroup
+        from torch.distributed._composable.fsdp._fsdp_state import FSDPState
+    except (ImportError, ModuleNotFoundError):
+        from torch.distributed.fsdp._fully_shard import _fsdp_init
+        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+        from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
     from torch.distributed._tensor.api import DTensor
 else:
     FSDPParam = object
@@ -24,6 +30,7 @@ class FSDP2PatchContext(metaclass=SingletonMeta):
     ORIGINAL_FSDP_STATE_PRE_BACKWARD: Optional[Callable] = None
     ORIGINAL_FSDP_PARAM_GROUP_BACKWARD_PREFETCH: Optional[Callable] = None
     ORIGINAL_FSDP_STATE_POST_FORWARD: Optional[Callable] = None
+    ORIGINAL_FSDP_STATE_PRE_FORWARD: Optional[Callable] = None
     ORIGINAL_GET_MANAGED_STATES: Optional[Callable] = None
     ORIGINAL_INIT_SHARDED_PARAM: Optional[Callable] = None
     FSDP2_PATCH_TORCH_VERSION = _FSDP2_PATCH_TORCH_VERSION
@@ -36,8 +43,11 @@ def patch_fsdp2_init_sharded_param():
         return
 
     @torch.no_grad()
-    def _atorch_init_sharded_param_wrapper(self, param: nn.Parameter, device: torch.device):
-        FSDP2PatchContext().ORIGINAL_INIT_SHARDED_PARAM(self, param, device)
+    def _atorch_init_sharded_param_wrapper(self, param: nn.Parameter, device: torch.device, shard_placement_fn=None):
+        if torch_version() >= (2, 6, 0):  # type: ignore
+            FSDP2PatchContext().ORIGINAL_INIT_SHARDED_PARAM(self, param, device, shard_placement_fn)
+        else:
+            FSDP2PatchContext().ORIGINAL_INIT_SHARDED_PARAM(self, param, device)
 
         if hasattr(param, FSDPConstants.CHECKPOINT_NAME):
             setattr(self.sharded_param, FSDPConstants.CHECKPOINT_NAME, param.checkpoint_name)
@@ -127,3 +137,26 @@ def patch_fsdp2_post_forward():
 
     FSDP2PatchContext().ORIGINAL_FSDP_STATE_POST_FORWARD = FSDPState._post_forward
     FSDPState._post_forward = _atorch_post_forward_wrapper
+
+
+def patch_fsdp2_pre_forward():
+    assert torch_version() >= FSDP2PatchContext().FSDP2_PATCH_TORCH_VERSION  # type: ignore
+    if FSDP2PatchContext().ORIGINAL_FSDP_STATE_PRE_FORWARD is not None:
+        return
+
+    def _atorch_pre_forward_wrapper(self, module, args, kwargs):
+        condition = torch.is_grad_enabled() and getattr(self, "_is_inter_state", False)
+
+        if condition:
+            old_states_to_forward_prefetch = self._states_to_forward_prefetch
+            self._states_to_forward_prefetch = []
+
+        res = FSDP2PatchContext().ORIGINAL_FSDP_STATE_PRE_FORWARD(self, module, args, kwargs)
+
+        if condition:
+            self._states_to_forward_prefetch = old_states_to_forward_prefetch
+
+        return res
+
+    FSDP2PatchContext().ORIGINAL_FSDP_STATE_PRE_FORWARD = FSDPState._pre_forward
+    FSDPState._pre_forward = _atorch_pre_forward_wrapper

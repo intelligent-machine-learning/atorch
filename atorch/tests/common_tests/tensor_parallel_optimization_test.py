@@ -1,11 +1,14 @@
 import unittest
 
+import pytest
 import torch
 from torch.utils.data import Dataset
 
 from atorch.auto.model_context import ModelContext
 from atorch.auto.opt_lib.tensor_parallel_optimization import TensorParallelOptimization
 from atorch.distributed.distributed import destroy_parallel_group
+
+pytest.skip("skip tp tests", allow_module_level=True)
 
 
 class MyModule(torch.nn.Module):

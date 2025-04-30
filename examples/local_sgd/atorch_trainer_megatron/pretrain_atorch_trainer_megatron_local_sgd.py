@@ -656,20 +656,29 @@ class GPTTrainStep(MegatronTrainStep):
 
         return forward_step
 
-    def loss_postprocessing(self, losses_reduced):
+    def loss_postprocessing(self, monitor_dict):
         # return super().loss_postprocessing(losses_reduced)
         """
         Loss postprocessing. Average losses across all micro-batches.
 
         Args:
-            losses_reduced: (List[torch.Tensor]):
-                A list of losses with a length of pipeline depth, which is equal to
-                `global_batch_size/data_parallel_size/micro_batch_size`.
+            monitor_dict: a dict to hold all related monitored matrix
+                related keys:
+                losses_reduced: (List[torch.Tensor]):
+                    A list of losses with a length of pipeline depth, which is equal to
+                    `global_batch_size/data_parallel_size/micro_batch_size`.
+                total_grad_norm:
+                    total grad_norm (for all parmas).
         Returns:
             A 2-tuple, the first element is a loss dict to log, and the second element is
             a ratio if the spike loss condition is met; otherwise, it will be None.
 
         """
+        losses_reduced = monitor_dict.get("losses_reduced", None)
+        assert losses_reduced is not None, "losses reduced should not be None"
+
+        total_grad_norm = monitor_dict.get("total_grad_norm", None)  # noqa: F841
+
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             # Average loss across microbatches.
             loss_reduced = {}

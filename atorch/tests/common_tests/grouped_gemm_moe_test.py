@@ -16,7 +16,8 @@ import atorch.distributed
 from atorch import npu  # noqa
 from atorch.common.util_func import divide, find_free_port
 from atorch.distributed.distributed import create_parallel_group
-from atorch.modules.moe.grouped_gemm_moe import Grouped_GEMM_MoE, SwiGLUActivatition
+from atorch.modules.moe.grouped_gemm_moe import Grouped_GEMM_MoE, MOEContext, SwiGLUActivatition
+from atorch.utils.grouped_gemm_util import get_groupped_gemm_moe_cls
 from atorch.utils.import_util import is_torch_npu_available
 from atorch.utils.version import torch_version
 
@@ -795,3 +796,53 @@ class TestEPGroupedGemmMoE(unittest.TestCase):
         os.environ["MASTER_ADDR"] = ""
         os.environ["MASTER_PORT"] = ""
         del os.environ["MOE_FSDP_PREFETCH_NUM"]
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch_version() < (2, 0, 0),  # type: ignore
+    "Must have at least 4 GPUs for expert parallel test",
+)
+class TestGrouppedGemmAboutPrefix(unittest.TestCase):
+    def test_groupped_gemm_with_mlp_prefix(self):
+        MOEContext().MLP_PREFIX_FROM_USER_ARG = None
+        expert_cls = get_groupped_gemm_moe_cls(with_mlp_prefix=True)
+        expert = expert_cls(
+            hidden_size=1024,
+            expert_intermediate_size=1408,
+            output_dropout_prob=0,
+            num_experts=4,
+            topk=1,
+            use_swiglu=False,
+            use_bias=False,
+            initializer_range=0.02,
+            use_expert_parallelism=False,
+            expert_parallel_group=None,
+            merge_w1_v1=True,
+            transpose_w1=True,
+            is_scale_gradient=False,
+            implementation_type="MegaBlocks",
+            token_dispatcher_type="AllToAll",
+        )
+        assert hasattr(expert, "w1") and hasattr(expert, "w2")
+
+    def test_grouped_gemm_without_mlp_prefix(self):
+        MOEContext().MLP_PREFIX_FROM_USER_ARG = None
+        expert_cls = get_groupped_gemm_moe_cls(with_mlp_prefix=False)
+        expert = expert_cls(
+            hidden_size=1024,
+            expert_intermediate_size=1408,
+            output_dropout_prob=0,
+            num_experts=4,
+            topk=1,
+            use_swiglu=False,
+            use_bias=False,
+            initializer_range=0.02,
+            use_expert_parallelism=False,
+            expert_parallel_group=None,
+            merge_w1_v1=True,
+            transpose_w1=True,
+            is_scale_gradient=False,
+            implementation_type="MegaBlocks",
+            token_dispatcher_type="AllToAll",
+        )
+        assert not hasattr(expert, "mlp")

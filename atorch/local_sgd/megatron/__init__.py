@@ -2,6 +2,7 @@ from packaging import version
 
 from atorch.common.log_utils import default_logger as logger
 from atorch.utils.import_util import is_megatron_lm_available
+from atorch.utils.version import get_megatron_version, is_megatron_version_bigger_than
 
 if is_megatron_lm_available():
     import megatron
@@ -10,14 +11,14 @@ if is_megatron_lm_available():
     from megatron import core as megatron_core
     from megatron.core.package_info import __version__ as megatron_version
 
-    if version.parse(megatron_version) >= version.parse("0.9.0"):
+    if is_megatron_version_bigger_than("0.9.0"):
         # these also imports megatron
         from .optimizer import get_megatron_optimizer
         from .parallel_state import initialize_model_parallel
         from .timers import Timers as LSDTimers
         from .training import get_model
     else:
-        logger.info(f"Local SGD is not supported on Megatron {megatron_version}")
+        logger.info(f"Local SGD is not supported on Megatron {get_megatron_version()}")
 
 from .arguments import local_sgd_args_provider
 
@@ -31,7 +32,7 @@ def _set_lsd_timers(args):
 
 def patch_megatron_for_local_sgd():
     logger.warning("Local SGD Megatron patches must be applied before megatron is initialized")
-    if is_megatron_lm_available() and version.parse(megatron_version) >= version.parse("0.9.0"):
+    if is_megatron_lm_available() and is_megatron_version_bigger_than("0.9.0"):
         # patch the Timers
         megatron_core.Timers = LSDTimers
         # patch initializer

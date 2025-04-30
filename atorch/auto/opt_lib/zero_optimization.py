@@ -44,17 +44,22 @@ from atorch.utils.patch_fsdp_param import (
     patch_fsdp2_get_managed_states,
     patch_fsdp2_post_forward,
     patch_fsdp2_pre_backward,
+    patch_fsdp2_pre_forward,
 )
 from atorch.utils.version import get_version, torch_version
 
 if torch_version() >= FSDP2PatchContext().FSDP2_PATCH_TORCH_VERSION:  # type: ignore
-    from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+    try:
+        from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+    except (ImportError, ModuleNotFoundError):
+        from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
     from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
     patch_fsdp2_get_managed_states()
     patch_fsdp2_pre_backward()
     patch_fsdp2_backward_prefetch()
     patch_fsdp2_post_forward()
+    patch_fsdp2_pre_forward()
 else:
     fully_shard = None
     MixedPrecisionPolicy = object

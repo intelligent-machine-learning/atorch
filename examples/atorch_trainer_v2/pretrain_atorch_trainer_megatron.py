@@ -27,11 +27,11 @@ import re
 import sys
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import yaml  # type: ignore[import]
-from packaging import version
+from packaging.version import Version
 from transformers import MODEL_FOR_CAUSAL_LM_MAPPING, HfArgumentParser, TrainerCallback
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -51,6 +51,7 @@ from atorch.trainer.args import AtorchTrainingArgs
 from atorch.trainer.atorch_trainer_v2 import AtorchTrainerV2
 from atorch.trainer.megatron import MegatronTrainStep
 from atorch.utils.import_util import is_megatron_lm_available
+from atorch.utils.version import get_megatron_version, is_megatron_version_bigger_than
 
 if is_megatron_lm_available():
     import megatron.legacy.model
@@ -62,16 +63,11 @@ if is_megatron_lm_available():
         get_gpt_layer_local_spec,
         get_gpt_layer_with_transformer_engine_spec,
     )
-    from megatron.core.package_info import __version__ as megatron_version
     from megatron.core.transformer.spec_utils import import_module
     from megatron.legacy.data.data_samplers import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
     from megatron.training import get_args, get_tokenizer, print_rank_0
     from megatron.training.arguments import core_transformer_config_from_args
-    from megatron.training.utils import (
-        average_losses_across_data_parallel_group,
-        get_batch_on_this_cp_rank,
-        get_batch_on_this_tp_rank,
-    )
+    from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
     from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -356,7 +352,38 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     def core_gpt_dataset_config_from_args(args):
         tokenizer = get_tokenizer()
 
-        if version.parse(megatron_version) > version.parse("0.6.0"):
+        if is_megatron_version_bigger_than("0.10.0"):
+            from megatron.training.utils import get_blend_and_blend_per_split
+
+            # Sometimes --data-path is too long, instead we parse it from a file.
+            blend: Optional[Tuple[List[str], Optional[List[float]]]]
+            blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+            blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+            other_args = {}
+            if get_megatron_version() == Version("0.10.0"):
+                other_args.update(
+                    renormalize_blend_weights=args.renormalize_blend_weights,
+                )
+
+            return GPTDatasetConfig(
+                random_seed=args.seed,
+                sequence_length=args.seq_length,
+                blend=blend,
+                blend_per_split=blend_per_split,
+                split=args.split,
+                num_dataset_builder_threads=args.num_dataset_builder_threads,
+                path_to_cache=args.data_cache_path,
+                mmap_bin_files=args.mmap_bin_files,
+                tokenizer=tokenizer,
+                reset_position_ids=args.reset_position_ids,
+                reset_attention_mask=args.reset_attention_mask,
+                eod_mask_loss=args.eod_mask_loss,
+                create_attention_mask=args.create_attention_mask_in_dataloader,
+                s3_cache_path=args.s3_cache_path,
+                **other_args,
+            )
+        elif is_megatron_version_bigger_than("0.6.0", check_equality=False):
             from megatron.core.datasets.utils import get_blend_from_list
 
             return GPTDatasetConfig(
@@ -423,11 +450,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
     """Build pretraining data iterators."""
 
-    def cyclic_iter(iter):
-        while True:
-            for x in iter:
-                yield x
-
     def get_train_valid_test_num_samples():
         """Train/valid/test num samples."""
 
@@ -439,7 +461,10 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         else:
             train_samples = args.train_iters * args.global_batch_size
         eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
-        test_iters = args.eval_iters
+        if hasattr(args, "test_iters"):
+            test_iters = args.test_iters
+        else:
+            test_iters = args.eval_iters
 
         return (
             train_samples,
@@ -560,38 +585,18 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         build_train_valid_test_datasets_provider
     )
 
-    # Build iterators.
-    dl_type = args.dataloader_type
-    assert dl_type in ["single", "cyclic", "external"]
-
-    def _get_iterator(dataloader_type, dataloader):
-        """Return dataset iterator."""
-        if dataloader_type == "single":
-            return iter(dataloader)
-        elif dataloader_type == "cyclic":
-            return iter(cyclic_iter(dataloader))
-        elif dataloader_type == "external":
-            # External dataloader is passed through. User is expected to define how to iterate.
-            return dataloader
-        else:
-            raise RuntimeError("unexpected dataloader type")
-
     if train_dataloader is not None:
-        train_data_iterator = _get_iterator(dl_type, train_dataloader)
-    else:
-        train_data_iterator = None
+        logger.info(f"[Rank {args.rank}] build dataloader over!")
+        logger.info(
+            f"[Rank {args.rank}] train_dataloader {len(train_dataloader)} valid_dataloader {len(valid_dataloader)}"
+            f" test_dataloader {len(test_dataloader)}",
+        )
+        logger.info(
+            f"[Rank {args.rank}] train_dataset {len(train_dataloader.dataset)}"
+            f" valid_dataset {len(valid_dataloader.dataset)} test_dataset {len(test_dataloader.dataset)}",
+        )
 
-    if valid_dataloader is not None:
-        valid_data_iterator = _get_iterator(dl_type, valid_dataloader)
-    else:
-        valid_data_iterator = None
-
-    if test_dataloader is not None:
-        test_data_iterator = _get_iterator(dl_type, test_dataloader)
-    else:
-        test_data_iterator = None
-
-    return train_data_iterator, valid_data_iterator, test_data_iterator
+    return train_dataloader, valid_dataloader, test_dataloader
 
 
 class GPTTrainStep(MegatronTrainStep):
@@ -642,35 +647,33 @@ class GPTTrainStep(MegatronTrainStep):
             Args:
                 loss_mask (torch.Tensor): Used to mask out some portions of the loss
                 output_tensor (torch.Tensor): The tensor with the losses
+
+            Returns:
+                the loss scalar for this micro-batch
+                the number of non-padded tokens in this microbatch
+                a dict containing reporting metrics on the loss and number of tokens across
+                    the data parallel ranks
             """
             args = get_args()
 
             losses = output_tensor.float()
             loss_mask = loss_mask.view(-1).float()
-            if args.context_parallel_size > 1:
-                loss = torch.cat(
-                    [
-                        torch.sum(losses.view(-1) * loss_mask).view(1),
-                        loss_mask.sum().view(1),
-                    ]
-                )
-                torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-                loss = loss[0] / loss[1]
-            else:
-                loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+            total_tokens = loss_mask.sum()
+            loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
 
-            # Check individual rank losses are not NaN prior to DP all-reduce.
-            if args.check_for_nan_in_loss_and_grad:
-                global_rank = torch.distributed.get_rank()
-                assert not loss.isnan(), (
-                    f"Rank {global_rank}: found NaN in local forward loss calculation. "
-                    f"Device: {torch.cuda.current_device()}, node: {os.uname()[1]}"
-                )
+            if args.context_parallel_size > 1:
+                torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
             # Reduce loss for logging.
-            averaged_loss = average_losses_across_data_parallel_group([loss])
+            reporting_loss = loss.clone().detach()
+            torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
-            return loss * args.context_parallel_size, {"lm loss": averaged_loss[0]}
+            local_num_tokens = loss[1].clone().detach().to(torch.int)
+            return (
+                loss[0] * args.context_parallel_size,
+                local_num_tokens,
+                {"lm loss": (reporting_loss[0], reporting_loss[1])},
+            )
 
         return loss_func
 
@@ -690,26 +693,59 @@ class GPTTrainStep(MegatronTrainStep):
 
         return forward_step
 
-    def loss_postprocessing(self, losses_reduced):
-        # return super().loss_postprocessing(losses_reduced)
+    def loss_postprocessing(self, monitor_dict):
         """
         Loss postprocessing. Average losses across all micro-batches.
 
         Args:
-            losses_reduced: (List[torch.Tensor]):
-                A list of losses with a length of pipeline depth, which is equal to
-                `global_batch_size/data_parallel_size/micro_batch_size`.
+            monitor_dict: a dict to hold all related monitored matrix
+                In train process: {losses_reduced: [], total_grad_norm: float or None}
+                    losses_reduced: (List[torch.Tensor]):
+                        A list of losses whose length equals to the number of microbatches, `global_batch_size/data_parallel_size/micro_batch_size`.  # noqa E501
+                    total_grad_norm (Only in training process):
+                        total grad_norm (for all params).
+                In eval or test process: {losses_reduced: []}
+                    losses_reduced: (List[torch.Tensor])
         Returns:
-            A 2-tuple, the first element is a loss dict to log, and the second element is
-            a ratio if the spike loss condition is met; otherwise, it will be None.
-
+            A dict:
+                In train process: return {"loss_to_log": Dict, "spike_loss_ratio": float or None}
+                    The first one is a train loss dict to log, and the second one is a ratio if the spike loss occurs.
+                In eval or test process: return {"loss_to_log": Dict}
         """
+
+        args = get_args()
+
+        assert "losses_reduced" in monitor_dict
+
+        losses_reduced = monitor_dict.get("losses_reduced", None)
+
+        # args.forward_mode is a internal intermediate variable to indicate current forward mode.
+        # args.forward_mode belongs to ["train", "eval", "test"]
+        if args.forward_mode == "train":
+            total_grad_norm = monitor_dict.get("total_grad_norm", None)  # noqa: F841
+            res = {"loss_to_log": {}, "spike_loss_ratio": None}
+        else:
+            res = {"loss_to_log": {}}
+
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             # Average loss across microbatches.
             loss_reduced = {}
-            for key in losses_reduced[0]:
-                losses_reduced_for_key = [x[key] for x in losses_reduced]
-                loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+            for key in losses_reduced[0].keys():
+                numerator = 0
+                denominator = 0
+                for x in losses_reduced:
+                    val = x[key]
+                    # there is one dict per microbatch. in new reporting, we average
+                    # over the total number of tokens across the global batch.
+                    if isinstance(val, tuple) or isinstance(val, list):
+                        numerator += val[0]
+                        denominator += val[1]
+                    else:
+                        # legacy behavior. we average over the number of microbatches,
+                        # and so the denominator is 1.
+                        numerator += val
+                        denominator += 1
+                loss_reduced[key] = numerator / denominator
             ##################################
             # Just for testing spike loss
             ratio = None
@@ -725,11 +761,11 @@ class GPTTrainStep(MegatronTrainStep):
                     f' current loss {loss_reduced["lm loss"]}, last loss: {self.last_loss}, spike_loss: {spike_loss}'
                 )
             self.last_loss = loss_reduced["lm loss"]
-            return loss_reduced, ratio
+            res["loss_to_log"] = loss_reduced
+            res["spike_loss_ratio"] = ratio
             # Just for testing spike loss
             ##################################
-            return loss_reduced, None
-        return {}, None
+        return res
 
 
 class CustomCallback(TrainerCallback):

@@ -4,12 +4,13 @@ from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.storage import WriteResult
 
 from atorch.trainer.args import AtorchTrainingArgs
-from atorch.trainer.fsdp.dcp_forked import async_save
 from atorch.trainer.fsdp.fsdp_ckpt_saver import ExtraState, FsdpCkptSaver, get_ckpt_trace_file_path
 from atorch.trainer.utils import is_main_process
 
 try:
     from torch.distributed.checkpoint.stateful import Stateful
+
+    from atorch.trainer.fsdp.dcp_forked import async_save
 except Exception:
     raise ImportError("To use FSDP dcp save/load, you need pytorch version >= 2.4.0")
 

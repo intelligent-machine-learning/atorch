@@ -4,7 +4,7 @@ from typing import Union
 from urllib.request import urlretrieve
 
 import pytest  # noqa: E402
-from packaging import version
+from packaging.version import Version
 
 import atorch  # noqa: E402
 from atorch.common.log_utils import default_logger as logger  # noqa: E402
@@ -30,7 +30,7 @@ from atorch.trainer.args import AtorchTrainingArgs  # noqa: E402
 from atorch.trainer.atorch_trainer_v2 import AtorchTrainerV2  # noqa: E402
 from atorch.trainer.megatron import MegatronTrainStep  # noqa: E402
 from atorch.utils.import_util import is_megatron_lm_available  # noqa: E402
-from atorch.utils.version import torch_version  # noqa: E402
+from atorch.utils.version import get_megatron_version, is_megatron_version_bigger_than, torch_version  # noqa: E402
 
 assert is_megatron_lm_available(), f"Can't import megatron, PYTHONPATH={os.environ['PYTHONPATH']}"
 
@@ -44,7 +44,6 @@ if is_megatron_lm_available():
         get_gpt_layer_local_spec,
         get_gpt_layer_with_transformer_engine_spec,
     )
-    from megatron.core.package_info import __version__ as megatron_version
     from megatron.core.transformer.spec_utils import import_module
     from megatron.training import get_args, get_tokenizer, print_rank_0
     from megatron.training.arguments import core_transformer_config_from_args
@@ -128,7 +127,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     def core_gpt_dataset_config_from_args(args):
         tokenizer = get_tokenizer()
 
-        if version.parse(megatron_version) > version.parse("0.6.0"):
+        if is_megatron_version_bigger_than("0.6.0", check_equality=False):
             from megatron.core.datasets.utils import get_blend_from_list
 
             return GPTDatasetConfig(
@@ -432,7 +431,7 @@ def run_atorch_megatron_local_sgd_trainer_v2(rank, world_size):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Skip cpu ut, only run on gpu.")
 @pytest.mark.skipif(torch_version() < (2, 0, 0), reason="AtorchTrainer need torch2.0 .")  # type: ignore
-@pytest.mark.skipif(version.parse(megatron_version) < version.parse("0.9.0"), reason="Only support megatron 0.9.0")
+@pytest.mark.skipif(get_megatron_version != Version("0.9.0"), reason="Only support megatron 0.9.0")
 @pytest.mark.parametrize("gpu_num", [4])
 def test_atorch_trainer(gpu_num):
     if not download_tokenizer_file():

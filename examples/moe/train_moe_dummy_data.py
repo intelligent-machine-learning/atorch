@@ -17,7 +17,7 @@ from moe_modules import (
 )
 from torch.distributed.fsdp.wrap import CustomPolicy
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaForCausalLM
 
 import atorch
 from atorch.auto.accelerate import auto_accelerate
@@ -27,7 +27,13 @@ from atorch.common.util_func import data_to_device
 from atorch.distributed.distributed import destroy_parallel_group
 from atorch.modules.moe.grouped_gemm_moe import Grouped_GEMM_MoE
 from atorch.utils.import_util import is_torch_npu_available
-from atorch.utils.moe_util import clip_grad_norm_, compute_grad_norm_, compute_param_norm_, set_inter_fsdp_state
+from atorch.utils.moe_util import (
+    _set_moe_forward_prefetch_for_fsdp2_ep,
+    clip_grad_norm_,
+    compute_grad_norm_,
+    compute_param_norm_,
+    set_inter_fsdp_state,
+)
 from atorch.utils.version import torch_version
 
 
@@ -295,6 +301,7 @@ def train(args):
 
     if args.ep_size > 1 and args.use_fsdp2:
         set_inter_fsdp_state(model, LlamaDecoderLayer, Grouped_GEMM_MoE)
+        _set_moe_forward_prefetch_for_fsdp2_ep(model, LlamaDecoderLayer, Grouped_GEMM_MoE, LlamaForCausalLM)
 
     train_state = TrainState()
 

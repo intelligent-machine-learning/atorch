@@ -49,8 +49,12 @@ def get_version(package):
     return tuple(digits)
 
 
-def package_version_smaller_than(pkg_name, version):
+def package_version_smaller_than(pkg_name, version, print_version=False):
     pkg_v = metadata.version(pkg_name)
+    if print_version:
+        from atorch.common.log_utils import default_logger as logger
+
+        logger.info(f"using {pkg_name} version: {pkg_v}")
     return Version(pkg_v) < Version(version)
 
 
@@ -62,3 +66,15 @@ def package_version_bigger_than(pkg_name, version):
 def package_version_equal_to(pkg_name, version):
     pkg_v = metadata.version(pkg_name)
     return Version(pkg_v) == Version(version)
+
+
+def get_megatron_version():
+    from megatron.core.package_info import __version__
+
+    return Version(__version__)
+
+
+def is_megatron_version_bigger_than(version, check_equality=True):
+    if check_equality:
+        return get_megatron_version() >= Version(version)
+    return get_megatron_version() > Version(version)
