@@ -67,7 +67,7 @@ def test_is_frozen_dataclass():
 def test_thread_file_config_monitor(tmp_path):
     config_path = tmp_path / "test_config.json"
     monitor = ThreadFileConfigMonitor(
-        config_path.as_posix(),
+        [config_path.as_posix()],
         BarConfig,
         poll_interval=1,
         validator=lambda x: x.a == 1,

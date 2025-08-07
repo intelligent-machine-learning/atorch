@@ -64,7 +64,7 @@ def cross_entropy_fwd_kernel(
     else:
         label_idx -= class_start_idx
         if label_idx >= col_block_idx * BLOCK_SIZE and label_idx < min(n_cols, (col_block_idx + 1) * BLOCK_SIZE):
-            logits_label = tl.load(logits_ptr + label_idx)
+            logits_label = tl.load(logits_ptr + label_idx).to(tl.float32)  # pragma: no cover
             if HAS_SMOOTHING:
                 loss = (
                     (lse if not SPLIT else 0.0)

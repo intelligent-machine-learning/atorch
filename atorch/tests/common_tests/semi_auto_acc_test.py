@@ -287,7 +287,8 @@ def run_gpt2_with_strategy(
             p_config = ([("data", zero_size)], None, True)
         else:
             p_config = None
-        if use_fa:
+        # new transformers version does not comparible with atorch fa
+        if use_fa and not use_fp8:
             strategy = [
                 ("parallel_mode", p_config),
                 "module_replace",

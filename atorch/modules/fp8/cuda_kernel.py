@@ -20,11 +20,11 @@ def tile_quant(
     dtype=torch.float8_e4m3fn,
     block_size: int = 128,
     pow_2_scale: bool = False,
+    eps: float = 0.0,
     return_transpose: bool = False,
     use_cublas=False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     # return qx, sx, qx_t, sx_t
-    eps = 1e-10
     # only 128 is supported for block_size for now
     assert block_size == 128
     return ops.quantize_vector_blockwise(
@@ -43,11 +43,11 @@ def block_quant(
     dtype=torch.float8_e4m3fn,
     block_size: int = 128,
     pow_2_scale: bool = False,
+    eps: float = 0.0,
     return_transpose: bool = False,
     use_cublas=False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     # return qx, sx, qx_t, sx_t
-    eps = 1e-10
     # only 128 is supported for block_size for now
     assert block_size == 128
     return ops.quantize_square_blockwise(

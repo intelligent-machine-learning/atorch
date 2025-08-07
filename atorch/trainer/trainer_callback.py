@@ -1,6 +1,9 @@
 import json
+import os
 from dataclasses import dataclass, fields
+from typing import List
 
+import torch
 from tqdm import tqdm
 from transformers.trainer_callback import CallbackHandler, TrainerCallback, TrainerControl, TrainerState
 from transformers.trainer_utils import IntervalStrategy
@@ -8,15 +11,24 @@ from transformers.trainer_utils import IntervalStrategy
 from atorch.common.log_utils import default_logger as logger
 from atorch.trainer.args import AtorchTrainingArgs
 from atorch.trainer.atorch_args import AtorchArguments
+from atorch.trainer.atorch_profiler import get_profiler
 from atorch.trainer.utils import DistributedType
 from atorch.trainer.utils import IntervalStrategy as AtorchIntervalStrategy
-from atorch.utils.import_util import is_megatron_lm_available
+from atorch.utils.dynamic_profiler import FileWatcher
+from atorch.utils.import_util import is_megatron_lm_available, is_torch_npu_available
 
 if is_megatron_lm_available():
     try:
         from megatron.training import get_current_global_batch_size
     except ImportError:
         from megatron.core.num_microbatches_calculator import get_current_global_batch_size
+
+
+if is_torch_npu_available():
+    try:
+        from torch_npu.profiler import dynamic_profile as dp
+    except ImportError:
+        dp = None
 
 
 @dataclass
@@ -125,10 +137,18 @@ class AtorchCallbackHandler(CallbackHandler):
             if not hasattr(callback, event):
                 continue
 
+            # 'tokenizer' is removed from CallbackHandler after transformers 4.45.0
+            if hasattr(self, "tokenizer"):
+                kwargs.update(tokenizer=self.tokenizer)
             result = getattr(callback, event)(
                 args,
                 state,
                 control,
+                model=self.model,
+                optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler,
+                train_dataloader=self.train_dataloader,
+                eval_dataloader=self.eval_dataloader,
                 **kwargs,
             )
             # A Callback can skip the return of `control` if it doesn't change it.
@@ -198,6 +218,32 @@ class FlowCallbackV2(AtorchTrainerCallback):
     A [`AtorchTrainerCallback`] that handles the default flow of the training loop for logs, evaluation and checkpoints.
     """
 
+    def __init__(self):
+        super().__init__()
+        self.save_ckpt_file_monitor = None
+        self.save_at_dynamic_steps = []
+
+    def on_train_begin(
+        self, args: AtorchTrainingArgs, state: AtorchTrainerState, control: AtorchTrainerControl, **kwargs
+    ):
+        if args.dynamic_save_config_path is not None:
+            self.save_ckpt_file_monitor = FileWatcher(args.dynamic_save_config_path, expire_time=0)
+            if os.path.exists(args.dynamic_save_config_path):
+                self.save_ckpt_file_monitor._last_mtime = os.path.getmtime(args.dynamic_save_config_path)
+                with open(args.dynamic_save_config_path, "r") as f:
+                    dynamic_saving_config = json.loads(f.read())
+                    if "save_at_dynamic_steps" in dynamic_saving_config and isinstance(
+                        dynamic_saving_config["save_at_dynamic_steps"], List
+                    ):
+                        self.save_at_dynamic_steps = dynamic_saving_config["save_at_dynamic_steps"]
+                        logger.info(
+                            f"[Dynamic saving] checkpoint at global steps {self.save_at_dynamic_steps} will be saved!"
+                        )
+                    else:
+                        logger.info(
+                            f"[WARNING] You should set 'save_at_dynamic_steps' to a list in {args.dynamic_save_config_path}"  # noqa: E501
+                        )
+
     def on_step_begin(
         self, args: AtorchTrainingArgs, state: AtorchTrainerState, control: AtorchTrainerControl, **kwargs
     ):
@@ -242,6 +288,23 @@ class FlowCallbackV2(AtorchTrainerCallback):
                 should_save = True
             return should_save
 
+        def _save_at_dynamic_steps():
+            if self.save_ckpt_file_monitor is None:
+                return False
+            file_content, _ = self.save_ckpt_file_monitor.read_if_modified()
+            if file_content is not None:
+                config_dict = json.loads(file_content)
+                if "save_at_dynamic_steps" in config_dict and isinstance(config_dict["save_at_dynamic_steps"], list):
+                    self.save_at_dynamic_steps = config_dict["save_at_dynamic_steps"]
+                    logger.info(
+                        f"[Dynamic saving] checkpoint at global steps {self.save_at_dynamic_steps} will be saved!"
+                    )
+                else:
+                    logger.info(
+                        f"[WARNING] You should set 'save_at_dynamic_steps' to a list in {args.dynamic_save_config_path}"
+                    )
+            return state.global_step in self.save_at_dynamic_steps
+
         # Save
         if (
             (
@@ -259,6 +322,7 @@ class FlowCallbackV2(AtorchTrainerCallback):
                 args.extra_save_frequency_in_epoch is not None
                 and state.current_step_in_epoch in args.extra_save_frequency_in_epoch
             )
+            or _save_at_dynamic_steps()
         ):
             control.should_save = True
             # Extra judge about test.
@@ -341,3 +405,64 @@ class PredictCallback(AtorchTrainerCallback):
             if self.prediction_bar is not None:
                 self.prediction_bar.close()
             self.prediction_bar = None
+
+
+class ProfilerCallback(AtorchTrainerCallback):
+    """
+    A [`AtorchTrainerCallback`] that execute profiling.
+    """
+
+    def on_train_begin(
+        self,
+        args: AtorchTrainingArgs,
+        state: AtorchTrainerState,
+        control: AtorchTrainerControl,
+        **kwargs,
+    ):
+        self.prof = get_profiler(args)
+        if hasattr(self.prof, "start"):
+            self.prof.start()
+
+    def on_train_end(
+        self,
+        args: AtorchTrainingArgs,
+        state: AtorchTrainerState,
+        control: AtorchTrainerControl,
+        **kwargs,
+    ):
+        if hasattr(self.prof, "stop"):
+            self.prof.stop()
+
+    def on_step_begin(
+        self,
+        args: AtorchTrainingArgs,
+        state: AtorchTrainerState,
+        control: AtorchTrainerControl,
+        **kwargs,
+    ):
+        if (
+            args.profiler_type == "nsys"
+            and state.global_step == args.profile_step_start
+            and args.process_index in args.profile_ranks
+        ):
+            torch.cuda.cudart().cudaProfilerStart()
+            torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+
+    def on_step_end(
+        self,
+        args: AtorchTrainingArgs,
+        state: AtorchTrainerState,
+        control: AtorchTrainerControl,
+        **kwargs,
+    ):
+        if (
+            args.profiler_type == "nsys"
+            and state.global_step == args.profile_step_end
+            and args.process_index in args.profile_ranks
+        ):
+            torch.cuda.cudart().cudaProfilerStop()
+        elif args.profiler_type == "hw_dp":
+            if dp is not None:
+                dp.step()
+        elif self.prof is not None and hasattr(self.prof, "step"):
+            self.prof.step()

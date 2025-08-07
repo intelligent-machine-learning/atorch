@@ -275,6 +275,7 @@ def write_dict_to_tensorboard(writer, wandb_writer, index, metrics, prefix=""):
                 wandb_writer.log({key_to_write: value}, index)
 
 
+# TODO:(L1) Use original training_log on Megatron>=0.12
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -286,8 +287,8 @@ def training_log(
     skipped_iter,
     grad_norm,
     params_norm,
-    params_std,
     num_zeros_in_grad,
+    params_std,
     custom_metrics,
 ):
     """Log training information such as losses, timing, ...."""
@@ -367,6 +368,11 @@ def training_log(
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
+    if is_megatron_version_bigger_than("0.11.0"):
+        from megatron.training.utils import reduce_max_stat_across_model_parallel_group
+
+        # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
+        learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
     # Tensorboard values.
     # Timer requires all the ranks to call.
     if args.log_timers_to_tensorboard and (iteration % args.tensorboard_log_interval == 0):
@@ -387,24 +393,22 @@ def training_log(
         if wandb_writer:
             wandb_writer.log({"samples vs steps": args.consumed_train_samples}, iteration)
 
-        should_log_learning_rate_to_tensorboard = (
-            args.log_learning_rate_to_tensorboard if hasattr(args, "log_learning_rate_to_tensorboard") else True
-        )
-        if should_log_learning_rate_to_tensorboard:
-            writer.add_scalar("learning-rate", learning_rate, iteration)
-            if args.decoupled_lr is not None:
-                writer.add_scalar("decoupled-learning-rate", decoupled_learning_rate, iteration)
-            writer.add_scalar("learning-rate vs samples", learning_rate, args.consumed_train_samples)
+        writer.add_scalar("learning-rate", learning_rate, iteration)
+        writer.add_scalar("learning-rate vs samples", learning_rate, args.consumed_train_samples)
+        if wandb_writer:
+            wandb_writer.log({"learning-rate": learning_rate}, iteration)
+        if args.decoupled_lr is not None:
+            writer.add_scalar("decoupled-learning-rate", decoupled_learning_rate, iteration)
+        if args.skipped_train_samples > 0:
+            writer.add_scalar("skipped-train-samples", args.skipped_train_samples, iteration)
             if wandb_writer:
-                wandb_writer.log({"learning-rate": learning_rate}, iteration)
-        should_log_batch_size_to_tensorboard = (
-            args.log_batch_size_to_tensorboard if hasattr(args, "log_batch_size_to_tensorboard") else True
-        )
-        if should_log_batch_size_to_tensorboard:
-            writer.add_scalar("batch-size", batch_size, iteration)
-            writer.add_scalar("batch-size vs samples", batch_size, args.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({"batch-size": batch_size}, iteration)
+                wandb_writer.log({"skipped-train-samples": args.skipped_train_samples}, iteration)
+
+        writer.add_scalar("batch-size", batch_size, iteration)
+        writer.add_scalar("batch-size vs samples", batch_size, args.consumed_train_samples)
+        if wandb_writer:
+            wandb_writer.log({"batch-size": batch_size}, iteration)
+
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + " vs samples", loss_dict[key], args.consumed_train_samples)
@@ -453,6 +457,11 @@ def training_log(
                 iteration,
             )
             writer.add_scalar(
+                "mem-max-allocated-bytes",
+                mem_stats["allocated_bytes.all.peak"],
+                iteration,
+            )
+            writer.add_scalar(
                 "mem-allocated-count",
                 mem_stats["allocation.all.current"],
                 iteration,
@@ -465,9 +474,31 @@ def training_log(
 
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
-        track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
 
-    if hasattr(args, "mtp_num_layers") and args.mtp_num_layers is not None:
+        if is_megatron_version_bigger_than("0.12.0"):
+            track_names = []
+            if args.moe_router_load_balancing_type in ["aux_loss", "seq_aux_loss"]:
+                track_names.append("load_balancing_loss")
+            if args.moe_z_loss_coeff is not None:
+                track_names.append("z_loss")
+            track_moe_metrics(
+                loss_scale=moe_loss_scale,
+                iteration=iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+                total_loss_dict=total_loss_dict,
+                per_layer_logging=args.moe_per_layer_logging,
+                force_initialize=True,
+                track_names=track_names,
+                num_layers=args.num_layers,
+                moe_layer_freq=args.moe_layer_freq,
+            )
+        else:
+            track_moe_metrics(
+                moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging
+            )
+
+    if getattr(args, "mtp_num_layers", None) is not None:
         from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -557,13 +588,14 @@ def training_log(
             report_memory("(after {} iterations)".format(iteration))
             report_memory_flag = False
 
-        if hasattr(args, "use_local_sgd") and args.use_local_sgd:
-            # Lazy import patches for local sgd logging
-            from atorch.local_sgd.megatron.parallel_state import get_non_data_parallel_group
+        if not args.log_timers_to_tensorboard or iteration % args.tensorboard_log_interval != 0:
+            if hasattr(args, "use_local_sgd") and args.use_local_sgd:
+                # Lazy import patches for local sgd logging
+                from atorch.local_sgd.megatron.parallel_state import get_non_data_parallel_group
 
-            timers.log(timers_to_log, normalizer=args.log_interval, process_group=get_non_data_parallel_group())
-        else:
-            timers.log(timers_to_log, normalizer=args.log_interval)
+                timers.log(timers_to_log, normalizer=args.log_interval, process_group=get_non_data_parallel_group())
+            else:
+                timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag, all_logging_metrics
 
@@ -704,6 +736,8 @@ def scale_main_grad_for_spike_loss(
 
 
 def get_grads_in_optimizer(optimizer: "MegatronOptimizer"):
+    from atorch.utils.virtual_optimizer.megatron_virtual_optimizer import MegatronVirtualOptimizer
+
     if isinstance(optimizer, (DistributedOptimizer, Float16OptimizerWithFloat16Params)):
         optimizer._copy_model_grads_to_main_grads()
         return optimizer.get_main_grads_for_grad_norm()
@@ -712,6 +746,8 @@ def get_grads_in_optimizer(optimizer: "MegatronOptimizer"):
         for single_optimizer in optimizer.chained_optimizers:
             grads_for_scaling += get_grads_in_optimizer(single_optimizer)
         return grads_for_scaling
+    elif isinstance(optimizer, MegatronVirtualOptimizer):
+        return []
     else:
         raise ValueError(f"Unsupported optimizer type {type(optimizer)}")
 
@@ -724,6 +760,8 @@ def _get_grad_state_model_parallel_group(optimizer: "MegatronOptimizer"):
 
 
 def get_grad_norm_in_optimizer(optimizer: "MegatronOptimizer"):
+    from atorch.utils.virtual_optimizer.megatron_virtual_optimizer import MegatronVirtualOptimizer
+
     if isinstance(optimizer, (DistributedOptimizer, Float16OptimizerWithFloat16Params)):
         grads_for_norm = get_grads_in_optimizer(optimizer)
         return get_grad_norm_fp32(
@@ -735,6 +773,8 @@ def get_grad_norm_in_optimizer(optimizer: "MegatronOptimizer"):
         for single_optimizer in optimizer.chained_optimizers:
             grad_norms.append(get_grad_norm_in_optimizer(single_optimizer))
         return math.sqrt(sum([x**2 for x in grad_norms]))
+    elif isinstance(optimizer, MegatronVirtualOptimizer):
+        return 0
     else:
         raise ValueError(f"Unsupported optimizer type {type(optimizer)}")
 

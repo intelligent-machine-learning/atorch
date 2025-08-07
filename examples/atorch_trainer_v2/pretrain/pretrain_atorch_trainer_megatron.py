@@ -36,22 +36,14 @@ from transformers import MODEL_FOR_CAUSAL_LM_MAPPING, HfArgumentParser, TrainerC
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
-try:
-    import ant_patches
-except ModuleNotFoundError as e:
-    print(e)
-    print(
-        "Can't import ant_patches, if you want to use megatron with version >= 'core_r0.9.0', "
-        "please use 'ant_core_r0.9.0' branch."
-    )
-    ant_patches = None
-
 from atorch.common.log_utils import default_logger as logger
 from atorch.trainer.args import AtorchTrainingArgs
 from atorch.trainer.atorch_trainer_v2 import AtorchTrainerV2
 from atorch.trainer.megatron import MegatronTrainStep
 from atorch.utils.import_util import is_megatron_lm_available
 from atorch.utils.version import get_megatron_version, is_megatron_version_bigger_than
+
+# from .instruction_dataset_utils import InstructionDataset
 
 if is_megatron_lm_available():
     import megatron.legacy.model
@@ -65,7 +57,9 @@ if is_megatron_lm_available():
     )
     from megatron.core.transformer.spec_utils import import_module
     from megatron.legacy.data.data_samplers import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
-    from megatron.training import get_args, get_tokenizer, print_rank_0
+    from megatron.training import get_args
+    from megatron.training import get_tokenizer as megatron_get_tokenizer
+    from megatron.training import print_rank_0
     from megatron.training.arguments import core_transformer_config_from_args
     from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
     from megatron.training.yaml_arguments import core_transformer_config_from_yaml
@@ -193,6 +187,7 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The configuration name of the dataset to use (via the datasets library)."},
     )
+    dataset_path: Optional[str] = field(default=None, metadata={"help": "A dir containing dataset with .arrow format."})
     train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
     validation_file: Optional[str] = field(
         default=None,
@@ -247,6 +242,8 @@ class DataTrainingArguments:
         default=True,
         metadata={"help": "Whether to keep line breaks when using TXT files or not."},
     )
+
+    drop_last: bool = field(default=False, metadata={"help": "Whether to drop last batch in dataloader."})
 
     def __post_init__(self):
         if self.streaming:
@@ -350,7 +347,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         ) and mpu.get_tensor_model_parallel_rank() == 0
 
     def core_gpt_dataset_config_from_args(args):
-        tokenizer = get_tokenizer()
+        tokenizer = megatron_get_tokenizer()
 
         if is_megatron_version_bigger_than("0.10.0"):
             from megatron.training.utils import get_blend_and_blend_per_split
@@ -771,7 +768,6 @@ class GPTTrainStep(MegatronTrainStep):
 class CustomCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         pass
-        # print_rank_last(f"---> callback: {logs}")
 
 
 def main():
@@ -826,10 +822,10 @@ def main():
     train_valid_test_datasets_provider.is_distributed = True
 
     training_args.extra_configs["custom_model_provider_function"] = model_provider
+    training_args.extra_configs["custom_train_step_class"] = GPTTrainStep
     training_args.extra_configs["custom_megatron_dataloaders_provider_function"] = partial(
         build_train_valid_test_data_iterators, train_valid_test_datasets_provider
     )
-    training_args.extra_configs["custom_train_step_class"] = GPTTrainStep
 
     # Initialize our Trainer
     trainer = AtorchTrainerV2(

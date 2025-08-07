@@ -3,18 +3,20 @@ from typing import Any, Callable, List, Optional
 import torch
 
 from atorch.common.log_utils import default_logger as logger
-from atorch.trainer.args import AtorchTrainingArgs
+
+# from atorch.trainer.args import AtorchTrainingArgs  # noqa: E402
 from atorch.utils.import_util import is_megatron_lm_available
+from atorch.utils.virtual_optimizer.patch_utils import (
+    patch_chained_optimizer,
+    patch_distributed_optimizer,
+    virtual_distributed_optimizer_load_state_dict,
+    zero_out_shard_fp32_memory,
+)
 
 if is_megatron_lm_available():
     from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-    from megatron.core.optimizer import (
-        ChainedOptimizer,
-        MegatronOptimizer,
-        _get_param_groups,
-        _update_min_and_max_lr_in_param_groups,
-    )
-    from megatron.core.optimizer.distrib_optimizer import MixedPrecisionOptimizer
+    from megatron.core.optimizer import ChainedOptimizer, MegatronOptimizer, _get_param_groups
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, MixedPrecisionOptimizer
     from megatron.core.optimizer.grad_scaler import ConstantGradScaler, DynamicGradScaler, MegatronGradScaler
     from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
@@ -124,9 +126,15 @@ def _get_megatron_virtual_optimizer_based_on_param_groups(
     return optimizer
 
 
+class VirtualChainedOptimizer(ChainedOptimizer):
+    @torch.no_grad()
+    def step(self):
+        return True, 0.0, 0
+
+
 # Configure use_virtual_optimizer: true in antllm yaml file to enable this feature
-def get_megatron_virtual_optimizer(
-    train_args: AtorchTrainingArgs,
+def get_megatron_virtual_optimizer_v1(
+    train_args: Any,
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
     no_weight_decay_cond: Optional[Callable] = None,
@@ -142,20 +150,14 @@ def get_megatron_virtual_optimizer(
         no_weight_decay_cond,
         scale_lr_cond,
         lr_mult,
-        use_decoupled_learning_rate=config.decoupled_lr is not None,
-    )
-
-    param_groups = _update_min_and_max_lr_in_param_groups(
-        param_groups,
         lr=config.lr,
         min_lr=config.min_lr,
         decoupled_lr=config.decoupled_lr,
         decoupled_min_lr=config.decoupled_min_lr,
+        # use_decoupled_learning_rate=config.decoupled_lr is not None,
     )
-
     dense_param_groups = list(filter(lambda g: not g["is_expert_parallel"], param_groups))
     moe_param_groups = list(filter(lambda g: g["is_expert_parallel"], param_groups))
-
     optimizers = [
         _get_megatron_virtual_optimizer_based_on_param_groups(
             config,
@@ -173,20 +175,20 @@ def get_megatron_virtual_optimizer(
     if len(optimizers) == 1:
         return optimizers[0]
 
-    return ChainedOptimizer(optimizers)
+    opt = VirtualChainedOptimizer(optimizers)
+    return opt
 
 
 class MegatronVirtualOptimizer(MixedPrecisionOptimizer):
     def __init__(
         self,
-        #  train_args: AtorchTrainingArgs,
         optimizer: torch.optim.Optimizer,
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Optional[Callable] = None,
     ):
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
-        # self.train_args = train_args
+        self.is_stub_optimizer = False
         if hasattr(self.optimizer, "param_groups_master"):
             self.param_groups_master: List[Any] = []
 
@@ -231,3 +233,43 @@ class MegatronVirtualOptimizer(MixedPrecisionOptimizer):
         # for groups in ():
         #     for group in groups:
         #         _zero_grad_group_helper(group, set_to_none)
+
+    def _copy_model_grads_to_main_grads(self):
+        return
+
+    def _copy_main_params_to_model_params(self):
+        return
+
+
+def get_megatron_virtual_optimizer(
+    train_args: Any,
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    no_weight_decay_cond: Optional[Callable] = None,
+    scale_lr_cond: Optional[Callable] = None,
+    lr_mult: float = 1.0,
+):
+    from megatron.core.optimizer import get_megatron_optimizer
+
+    setattr(
+        DistributedOptimizer,
+        "load_state_dict",
+        staticmethod(virtual_distributed_optimizer_load_state_dict),
+    )
+
+    org_chained_optimizer = get_megatron_optimizer(
+        config,
+        model_chunks,
+        no_weight_decay_cond,
+        scale_lr_cond,
+        lr_mult,
+    )
+
+    zero_out_shard_fp32_memory(org_chained_optimizer)
+
+    patch_chained_optimizer(org_chained_optimizer)
+
+    for opt in org_chained_optimizer.chained_optimizers:
+        patch_distributed_optimizer(opt)
+
+    return org_chained_optimizer

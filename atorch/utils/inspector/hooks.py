@@ -1,3 +1,4 @@
+import inspect
 import os
 import re
 
@@ -85,6 +86,7 @@ class TensorInspector:
             except OSError:
                 logger.error(f"Cannot create directory {plot_tensor_dir}, plot_tensor is disabled.")
                 self.plot_tensor = False
+        self.hooks = []
 
     def enable(self, if_enable):
         self.enable = if_enable
@@ -102,6 +104,7 @@ class TensorInspector:
         exclude_tensor_name_pattern=None,
         layer_types=(torch.nn.Linear,),
         backward_use_e4m3=False,
+        te_fp8_check=False,
     ):
         """Register log tensor hook and save tensor hook"""
 
@@ -120,24 +123,37 @@ class TensorInspector:
             ):
 
                 # log tensor hook
-                layer.register_forward_hook(log_tensor_hook(name, self, is_fwd=True))
-                layer.register_full_backward_hook(
-                    log_tensor_hook(name, self, is_fwd=False, backward_use_e4m3=backward_use_e4m3)
+                hook = layer.register_forward_hook(log_tensor_hook(name, self, is_fwd=True, te_fp8_check=te_fp8_check))
+                self.hooks.append(hook)
+                hook = layer.register_full_backward_hook(
+                    log_tensor_hook(
+                        name, self, is_fwd=False, backward_use_e4m3=backward_use_e4m3, te_fp8_check=te_fp8_check
+                    )
                 )
+                self.hooks.append(hook)
 
                 # save tensor hook
                 if self.save_tensor:
-                    layer.register_forward_hook(save_tensor_hook(name, self, is_fwd=True))
-                    layer.register_full_backward_hook(save_tensor_hook(name, self, is_fwd=False))
+                    hook = layer.register_forward_hook(save_tensor_hook(name, self, is_fwd=True))
+                    self.hooks.append(hook)
+                    hook = layer.register_full_backward_hook(save_tensor_hook(name, self, is_fwd=False))
+                    self.hooks.append(hook)
 
                 # plot tensor hook
                 if self.plot_tensor:
-                    layer.register_forward_hook(plot_tensor_hook(name, self, is_fwd=True))
-                    layer.register_full_backward_hook(plot_tensor_hook(name, self, is_fwd=False))
+                    hook = layer.register_forward_hook(plot_tensor_hook(name, self, is_fwd=True))
+                    self.hooks.append(hook)
+                    hook = layer.register_full_backward_hook(plot_tensor_hook(name, self, is_fwd=False))
+                    self.hooks.append(hook)
 
                 matched_modules.append(name)
 
         return matched_modules
+
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
 
 
 def calculate_percentiles(activations):
@@ -260,7 +276,10 @@ def save_tensor_hook(module_name, inspector, is_fwd=True):
             else:
                 tensors = {}
 
-            tensors[tensor_names[1]] = outputs[0].detach().cpu()  # y or dy
+            if isinstance(outputs, tuple):
+                tensors[tensor_names[1]] = outputs[0].detach().cpu()  # y or dy
+            else:
+                tensors[tensor_names[1]] = outputs.detach().cpu()
 
             # save weight
             if is_fwd:
@@ -290,7 +309,7 @@ def save_tensor_hook(module_name, inspector, is_fwd=True):
     return hook
 
 
-def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False):
+def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False, te_fp8_check=False):
     """Set up hook for forward or backpropagation"""
     interval = inspector.log_tensor_interval
     log_fn = inspector.log_fn
@@ -322,7 +341,7 @@ def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False
 
             # get target tensor: (fwd_x & fwd_w) or bwd_dy
             targets = [
-                inputs[0] if is_fwd else outputs[0],
+                inputs[0] if is_fwd else outputs[0] if isinstance(outputs, tuple) else outputs,
             ]
             if is_fwd:
                 for p_name, p_tensor in module.named_parameters(recurse=False):
@@ -420,6 +439,12 @@ def log_tensor_hook(module_name, inspector, is_fwd=True, backward_use_e4m3=False
                         log_str += f", blockwise_underflows(%): {results['blockwise']:.1f}"
                         tb_dict["fp8_blockwise_underflows"] = results["blockwise"]
 
+                if te_fp8_check and index == 0:
+                    fp8_compute_cos = get_te_fp8_compute_cos_similarity(module, inputs, outputs, is_fwd)
+                    if fp8_compute_cos is not None:
+                        log_str += f", fp8 compute cos similarity: {fp8_compute_cos:.3e}"
+                        tb_dict["fp8_compute_cos_similarity"] = fp8_compute_cos
+
                 log_fn(log_str)
                 if inspector.summary_writer is not None:
                     # write to tensorboard
@@ -457,7 +482,7 @@ def plot_tensor_hook(module_name, inspector, is_fwd=True):
         if inspector.enable and (step % interval) == 0 and step != 0:
             # get target tensor: (fwd_x & fwd_w) or bwd_dy
             targets = [
-                inputs[0] if is_fwd else outputs[0],
+                inputs[0] if is_fwd else outputs[0] if isinstance(outputs, tuple) else outputs,
             ]
 
             # TODO: enable weight later on
@@ -480,3 +505,84 @@ def plot_tensor_hook(module_name, inspector, is_fwd=True):
                 log_fn(f"[plot tensor hook] Save tensor plot figure: {filename}")
 
     return hook
+
+
+def get_te_fp8_compute_cos_similarity(module, inputs, outputs, is_fwd):
+    try:
+        from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+        from transformer_engine.pytorch.module.base import _2X_ACC_DGRAD, get_multi_stream_cublas_workspace
+        from transformer_engine.pytorch.module.grouped_linear import GroupedLinear, _GroupedLinear
+        from transformer_engine.pytorch.tensor.quantized_tensor import QuantizedTensorBase
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    if isinstance(module, GroupedLinear):
+        weight_tensors = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
+        if not isinstance(weight_tensors[0], QuantizedTensorBase):
+            return None
+        bias_tensors = [getattr(module, f"bias{i}") for i in range(module.num_gemms)]
+        weight_tensors = [w.dequantize() for w in weight_tensors]
+        # Assuming only weights in fp8 format, inputs/outputs are in non-fp8 formats.
+        if is_fwd:
+            # bf16 forward to get bf16_outputs
+            none_quantizers = [None] * module.num_gemms
+            args = [
+                None,
+                inputs[0],
+                inputs[1],
+                module.apply_bias,
+                False,  # is_first_microbatch
+                False,  # fp8
+                False,  # fp8_calibration
+                None,  # wgrad_store
+                none_quantizers,  # input_quantizers
+                none_quantizers,  # weight_quantizers
+                none_quantizers,  # output_quantizers
+                none_quantizers,  # grad_output_quantizers
+                False,  # fuse_wgrad_accumulation
+                False,  # is_cpu_offload_enabled
+                module.sequence_parallel,
+                inputs[0].dtype,  # activation_dtype
+                False,  # is_grad_enabled
+                module,
+                None,  # skip_fp8_weight_update
+            ]
+            # new te version adds save_original_input param.
+            sig = inspect.signature(_GroupedLinear.forward)
+            if "save_original_input" in sig.parameters.keys():
+                args.append(False)
+            args += [
+                *weight_tensors,
+                *bias_tensors,
+            ]
+            bf16_outputs = _GroupedLinear.forward(*args)
+            module._cache_m_splits = inputs[1]
+            cos_similarity = cosine(bf16_outputs, outputs[0] if isinstance(outputs, tuple) else outputs)
+        else:
+            # bf16 backward to get bf16_outputs
+            g_output = outputs[0] if isinstance(outputs, tuple) else outputs
+            grad_output = g_output.contiguous()
+            grad_output_view = grad_output.view(-1, grad_output.shape[-1])
+            grad_output_mats = torch.split(grad_output_view, module._cache_m_splits)
+            bf16_outputs = torch.empty(
+                sum(module._cache_m_splits),
+                weight_tensors[0].shape[1],
+                dtype=g_output.dtype,
+                device=g_output.device,
+            )
+            general_grouped_gemm(
+                weight_tensors,
+                grad_output_mats,
+                [bf16_outputs],
+                g_output.dtype,
+                get_multi_stream_cublas_workspace(),
+                single_output=True,
+                layout="NN",
+                m_splits=module._cache_m_splits,
+                grad=True,
+                use_split_accumulator=_2X_ACC_DGRAD,
+            )
+            module._cache_m_splits = None
+            cos_similarity = cosine(bf16_outputs, inputs[0])
+        return cos_similarity
+    return None

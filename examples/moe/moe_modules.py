@@ -3,11 +3,19 @@ import inspect
 
 import torch
 import torch.nn.functional as F
+import transformers
+from packaging.version import Version
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers.models.llama import modeling_llama
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaModel, LlamaRMSNorm
+from transformers.models.llama.modeling_llama import (
+    LlamaDecoderLayer,
+    LlamaForCausalLM,
+    LlamaModel,
+    LlamaRMSNorm,
+    LlamaRotaryEmbedding,
+)
 
 from atorch.common.util_func import data_to_device
 from atorch.distributed.distributed import get_device_mesh
@@ -219,7 +227,11 @@ class LlamaChunk(LlamaModel):
             self.layer_num = config.num_hidden_layers
         else:
             self.layer_num = layer_num
-
+        if Version(transformers.__version__) >= Version("4.48.0"):
+            # 4.48.0 之后，传入 decoder_layer 的 position_embeddings 不能为 None。
+            self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        else:
+            self.rotary_emb = None
         self.layers = torch.nn.ModuleDict()
 
         for layer_idx_cur_stage in range(self.layer_num):
@@ -252,10 +264,15 @@ class LlamaChunk(LlamaModel):
 
         position_ids = torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
         position_ids = position_ids.unsqueeze(0)
+        position_embeddings = self.rotary_emb and self.rotary_emb(hidden_states, position_ids)
         for decoder_layer in self.layers.values():
-            hidden_states = decoder_layer(hidden_states, position_ids=position_ids)[0]
+            hidden_states = decoder_layer(
+                hidden_states,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )[0]
 
-        if self.norm is not None:
+        if self.norm is not None and self.lm_head is not None:
             hidden_states = self.norm(hidden_states)
             logits = self.lm_head(hidden_states)
             return logits

@@ -5,34 +5,39 @@ import numpy as np
 import pandas as pd
 import torch
 
-from atorch.auto.engine.sg_algo.hebo.acquisitions.acq import MACE, Acquisition, Mean, Sigma
-from atorch.auto.engine.sg_algo.hebo.design_space.design_space import DesignSpace
+try:
+    from atorch.auto.engine.sg_algo.hebo.acquisitions.acq import MACE, Acquisition, Mean, Sigma
+    from atorch.auto.engine.sg_algo.hebo.design_space.design_space import DesignSpace
 
+    class ToyExample(Acquisition):
+        def __init__(self, constr_v=1.0):
+            super().__init__(None)
+            self.constr_v = constr_v
 
-class ToyExample(Acquisition):
-    def __init__(self, constr_v=1.0):
-        super().__init__(None)
-        self.constr_v = constr_v
+        @property
+        def num_obj(self):
+            return 1
 
-    @property
-    def num_obj(self):
-        return 1
+        @property
+        def num_constr(self):
+            return 1
 
-    @property
-    def num_constr(self):
-        return 1
+        def eval(self, x, xe):
+            # minimize L2norm(x) s.t. L2norm(x) > constr_v
+            out = (xe**2).sum(axis=1).reshape(-1, 1)
+            constr = self.constr_v - out
+            return np.concatenate([out, constr], axis=1)
 
-    def eval(self, x, xe):
-        # minimize L2norm(x) s.t. L2norm(x) > constr_v
-        out = (xe**2).sum(axis=1).reshape(-1, 1)
-        constr = self.constr_v - out
-        return np.concatenate([out, constr], axis=1)
+    DEP_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    DEP_AVAILABLE = False
 
 
 def obj(x: pd.DataFrame) -> np.ndarray:
     return x["x0"].values.astype(float).reshape(-1, 1) ** 2
 
 
+@unittest.skipIf(not DEP_AVAILABLE, "missing dep")
 class HEBOTest(unittest.TestCase):
     def setUp(self):
         warnings.filterwarnings("ignore", category=DeprecationWarning)

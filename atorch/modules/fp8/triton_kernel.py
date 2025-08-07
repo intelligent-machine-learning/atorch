@@ -19,7 +19,7 @@ class RoundingMode(IntEnum):
 
 
 @triton.jit
-def block_quant_kernel(x_ptr, y_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr):  # pragma: no cover
+def block_quant_kernel(x_ptr, y_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr, EPS: tl.constexpr):  # pragma: no cover
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     n = tl.cdiv(N, BLOCK_SIZE)
@@ -28,20 +28,21 @@ def block_quant_kernel(x_ptr, y_ptr, s_ptr, M, N, BLOCK_SIZE: tl.constexpr):  # 
     offs = offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-    eps = 1e-10
-    s = tl.maximum(tl.max(tl.abs(x)), eps) / 448.0
+    s = tl.maximum(tl.max(tl.abs(x)), EPS) / 448.0
+    if s == 0.0:
+        s = 1.0
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
     tl.store(s_ptr + pid_m * n + pid_n, s)
 
 
-def block_quant(x: torch.Tensor, dtype=torch.float8_e4m3fn, block_size: int = 128) -> torch.Tensor:
+def block_quant(x: torch.Tensor, dtype=torch.float8_e4m3fn, block_size: int = 128, eps: float = 0.0) -> torch.Tensor:
     M, N = x.size()
     y = torch.empty_like(x, dtype=dtype)
     s = x.new_empty(x.size(-2) // block_size, x.size(-1) // block_size, dtype=torch.float32)
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE"]), triton.cdiv(N, meta["BLOCK_SIZE"]))  # noqa: E731
-    block_quant_kernel[grid](x, y, s, M, N, BLOCK_SIZE=block_size)
+    block_quant_kernel[grid](x, y, s, M, N, BLOCK_SIZE=block_size, EPS=eps)
     return y, s
 
 
@@ -92,13 +93,19 @@ def dequant(x: torch.Tensor, s: torch.Tensor, dtype=torch.float32, block_size: i
 
 @triton.jit
 def tile_quant_kernel(
-    x_ptr, y_ptr, s_ptr, scale_rounding_mode: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    scale_rounding_mode: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    EPS: tl.constexpr,
 ):  # pragma: no cover
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
-    eps = 1e-10
-    s = tl.maximum(tl.max(tl.abs(x)), eps) / 448.0
+    s = tl.maximum(tl.max(tl.abs(x)), EPS) / 448.0
+    if s == 0.0:
+        s = 1.0
     if scale_rounding_mode == 1:
         # ceil rounding to power of 2
         s = tl.ceil(tl.log2(s))
@@ -118,14 +125,18 @@ def tile_quant_kernel(
 
 
 def tile_quant(
-    x: torch.Tensor, dtype=torch.float8_e4m3fn, block_size: int = 128, scale_rounding_mode=RoundingMode.none
+    x: torch.Tensor,
+    dtype=torch.float8_e4m3fn,
+    block_size: int = 128,
+    scale_rounding_mode=RoundingMode.none,
+    eps: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous()
     assert x.size(-1) % block_size == 0
     y = torch.empty_like(x, dtype=dtype)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
-    tile_quant_kernel[grid](x, y, s, scale_rounding_mode, BLOCK_SIZE=block_size)
+    tile_quant_kernel[grid](x, y, s, scale_rounding_mode, BLOCK_SIZE=block_size, EPS=eps)
     return y, s
 
 

@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -7,6 +8,9 @@ from torch.utils.tensorboard import SummaryWriter
 from atorch.auto.accelerate import auto_accelerate
 from atorch.auto.opt_lib.amp_optimization import is_fp8_available
 from atorch.tests.toy_modules.toy_module import ToyDataset, ToyModel, loss_func, optim_func, prepare_input, run_train
+from atorch.tests.toy_modules.toy_module_te import get_input as get_te_input
+from atorch.tests.toy_modules.toy_module_te import get_model as get_te_model
+from atorch.tests.toy_modules.toy_module_te import loss_func as te_loss_func
 from atorch.utils.inspector import TensorInspector
 
 try:
@@ -15,6 +19,37 @@ try:
     _te_available = True
 except ImportError:
     _te_available = False
+
+
+def get_fp8_context(is_init, enabled=True):
+    if not enabled:
+        return nullcontext()
+    fp8_format = transformer_engine.common.recipe.Format.E4M3
+    fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
+    if is_init:
+        context_args = {"enabled": True, "recipe": fp8_recipe}
+
+        fp8_context = transformer_engine.pytorch.fp8_model_init(**context_args)
+    else:
+        fp8_context = transformer_engine.pytorch.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe, fp8_group=None)
+    return fp8_context
+
+
+def run_te_toy_model_with_inspector(hidden_size=256, num_gemms=4, use_fp8_init=False, use_fp8=False):
+    fp8_context_init = get_fp8_context(True, use_fp8_init)
+    with fp8_context_init:
+        model = get_te_model(hidden_size, num_gemms)
+    inspector = TensorInspector(2)
+    inspector.register_hooks(model, log_tensor_name_pattern="(gg)", te_fp8_check=use_fp8)
+    batch_size = 128 * num_gemms
+    for _ in range(5):
+        inputs = get_te_input(batch_size, hidden_size)
+        fp8_context = get_fp8_context(False, use_fp8)
+        with fp8_context:
+            outputs = model(inputs)
+        loss = te_loss_func(inputs, outputs)
+        loss.backward()
+        inspector.step()
 
 
 def run_toy_model_with_inspector(
@@ -91,10 +126,11 @@ def run_toy_model_with_inspector(
             summary_writer_items=summary_writer_items,
             log_underflows_for_linear=True,
         )
-    inspector.register_hooks(m_model, log_tensor_name_pattern="linears")
+    inspector.register_hooks(m_model, log_tensor_name_pattern="linears", te_fp8_check=True)
 
     device = "cuda"
     run_train(m_model, m_dataloader, m_optim, m_prepare_input, m_loss_func, device, inspector=inspector)
+    inspector.remove_hooks()
     summary_writer.close()
 
 
@@ -126,3 +162,14 @@ class TestTensorInspector(unittest.TestCase):
     def test_scaled_linear_inspector(self):
         summary_writer_items = ["tensorwise_underflows", "rowwise_underflows"]
         run_toy_model_with_inspector(use_fp8=True, use_te=False, summary_writer_items=summary_writer_items)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available() or not is_fp8_available(),
+        "No fp8 gpu or te available for scaled linear tests",
+    )
+    @pytest.mark.fp8
+    def test_te_module_inspector(self):
+        # init fp8, compute fp8
+        run_te_toy_model_with_inspector(use_fp8_init=True, use_fp8=True)
+        # init not fp8, compute fp8
+        run_te_toy_model_with_inspector(use_fp8_init=False, use_fp8=True)

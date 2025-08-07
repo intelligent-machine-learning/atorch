@@ -7,15 +7,18 @@ feature:
 """
 from __future__ import absolute_import, unicode_literals
 
+import glob
 from argparse import ArgumentParser
+from datetime import datetime
 from json import load
+from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
 
 
 def get_compute_kernel(df):
-    return df.query("cat == 'kernel' and ~name.str.startswith('nccl')")
+    return df.query("cat == 'kernel' and ~name.str.startswith('pccl') and ~name.str.startswith('nccl')")
 
 
 def prepare_df(json_obj):
@@ -61,7 +64,9 @@ def analyze_gpu_kernel(df, verbose=False):
         "div": "DivFunctor",
     }
     op_times = {
-        "gemm": gpu_kernel_df[gpu_kernel_df.name.str.contains("gemm")]["dur"].sum(),
+        "gemm": gpu_kernel_df[gpu_kernel_df.name.str.contains("gemm") ^ gpu_kernel_df.name.str.contains("nvjet")][
+            "dur"
+        ].sum(),
         "elementwise": {
             "total": gpu_kernel_df[gpu_kernel_df.name.str.contains("elementwise")]["dur"].sum(),
         },
@@ -130,9 +135,13 @@ def fused_kernels(kernels):
 
 
 def analyze_communicate_overlap(df, verbose=False):
-    comm_kernel_df = df.query("name.str.startswith('ncclKernel')|name.str.startswith('ncclDevKernel')")
+    comm_kernel_df = df.query(
+        "name.str.startswith('ncclKernel')|name.str.startswith('ncclDevKernel')|name.str.startswith('pcclKernel')"
+    )
     all_comm_tids = list(set(comm_kernel_df["tid"].values))
-    all_compute_tids = list(set(df.query("~name.str.startswith('nccl')")["tid"].values))
+    all_compute_tids = list(
+        set(df.query("~name.str.startswith('nccl') and ~name.str.startswith('pccl')")["tid"].values)
+    )
     if verbose:
         print("all_comm_tids", all_comm_tids)
         print("all_compute_tids", all_compute_tids)
@@ -146,6 +155,10 @@ def analyze_communicate_overlap(df, verbose=False):
             "nooverlap_comm_df": comm_kernel_df,
         }
     comm_time_us = comm_kernel_df["dur"].sum()
+    all2all_time_us = comm_kernel_df[comm_kernel_df["name"].str.contains("SendRecv")]["dur"].sum()
+    fsdp_time_us = comm_kernel_df.query("name.str.contains('AllGather') or name.str.contains('ReduceScatter')")[
+        "dur"
+    ].sum()
     # int64 = int64 + int64, can dur convert to int64?
     # gpu_kernel_df.loc[:,"finish_time"] = gpu_kernel_df["ts"] + gpu_kernel_df["dur"]
     # comm_kernel_df.loc[:,"finish_time"] = comm_kernel_df["ts"] + comm_kernel_df["dur"]
@@ -238,7 +251,75 @@ def analyze_communicate_overlap(df, verbose=False):
         "comm_time_us": comm_time_us,
         "overlap_time_us": overlap_time,
         "nooverlap_comm_df": nooverlap_comm_df,
+        "all2all_time_us": all2all_time_us,
+        "fsdp_time_us": fsdp_time_us,
     }
+
+
+def parse_trace_file(json_file, verbose=False):
+    with open(json_file, "r") as fin:
+        json_obj = load(fin)  # TODO: iter json_obj,save memory usage
+        df = prepare_df(json_obj)
+        min_ts = df["ts"].min()
+        if "profiler_starttime" in json_obj:
+            # convert to abs time
+            df["ts"] = df["ts"] + json_obj["profiler_starttime"] - min_ts
+            df["finish_time"] = df["finish_time"] + json_obj["profiler_starttime"] - min_ts
+        kernel_start_time = df.query("cat=='kernel'")["ts"].min()
+        # print("kernel 5 sample:\n", df.query("cat=='kernel'").head(n=5))
+
+        summary = analyze_gpu_kernel(df)
+        ret_communicate = analyze_communicate_overlap(df, verbose)
+        ret_communicate.pop("nooverlap_comm_df")
+        # print("communicate summary:", ret_communicate)
+        summary.update(ret_communicate)
+        # distributedInfo: {'backend': 'nccl', 'rank': 10, 'world_size': 16}
+        if "distributedInfo" in json_obj:
+            rank = json_obj["distributedInfo"]["rank"]
+        else:
+            rank = 0
+        summary["rank"] = rank
+        prepare_sample_df = df.query(
+            "cat=='python_function' and name.str.contains('torch/utils/data/dataloader.py')"
+            " and name.str.contains('__next__')"
+        )
+        _train_inner_loop_time = df.query("cat=='python_function' and name.str.contains('_train_inner_loop')")
+        backward_time = df.query("cat=='python_function' and name.str.contains('_engine_run_backward')")["dur"].sum()
+        summary["sample_time"] = int(prepare_sample_df["dur"].sum())
+        summary["total_time"] = int(_train_inner_loop_time["dur"].sum())
+        summary["backward_time"] = int(backward_time)
+        summary["gpu_time_us"] = int(summary["gpu_time_us"])
+        summary["comm_time_us"] = int(summary["comm_time_us"])
+        summary["overlap_time_us"] = int(summary["overlap_time_us"])
+        summary["memory_time"] = summary["op_cat_times"]["memory"]
+        return summary, kernel_start_time
+
+
+def print_profiler_summary(all_summary, kernel_start_times, all_summary_path=None):
+    all_summary_df = pd.DataFrame(all_summary)
+    print(all_summary_df)
+    if all_summary_path:
+        with open(all_summary_path, "w") as fout:
+            all_summary_df.to_csv(fout, index=False)
+    # check if all kernels start at the same time
+    pd.set_option("display.float_format", "{:.3f}".format)
+    print(all_summary_df.iloc[all_summary_df["comm_time_us"].idxmin()].op_cat_times)
+    print(
+        "total_time min/max rank is",
+        all_summary_df.iloc[all_summary_df["comm_time_us"].idxmin()],
+        all_summary_df.iloc[all_summary_df["comm_time_us"].idxmax()],
+    )
+    print(all_summary_df.describe())
+    kernel_start_times = np.asarray(kernel_start_times)
+
+    min_start_time = np.min(kernel_start_times)
+    print(
+        "min start_time=",
+        datetime.fromtimestamp(min_start_time / 1e6),
+        "max start_time=",
+        datetime.fromtimestamp(np.max(kernel_start_times) / 1e6),
+    )
+    print(kernel_start_times - min_start_time)
 
 
 def main():
@@ -246,39 +327,30 @@ def main():
     parser.add_argument(
         "--all_summary_path",
     )
+    parser.add_argument("--process_num", "-p", type=int, default=1)
     parser.add_argument("json_files", nargs="*")
+
     parser.add_argument("--verbose", "-v", action="store_true")
 
     args = parser.parse_args()
     kernel_start_times = []
     all_summary = []
-    for json_file in args.json_files:
-        with open(json_file, "r") as fin:
-            json_obj = load(fin)  # TODO: iter json_obj,save memory usage
-            df = prepare_df(json_obj)
-            kernel_start_times.append(df.query("cat=='kernel'")["ts"].min())
-            print("kernel 5 sample:\n", df.query("cat=='kernel'").head(n=5))
-
-            ret = analyze_gpu_kernel(df)
-            print("compute summary:", ret)
-            ret_communicate = analyze_communicate_overlap(df, args.verbose)
-            nooverlap_comm_df = ret_communicate.pop("nooverlap_comm_df")
-            print("communicate summary:", ret_communicate)
-            ret.update(ret_communicate)
-            # distributedInfo: {'backend': 'nccl', 'rank': 10, 'world_size': 16}
-            rank = json_obj["distributedInfo"]["rank"]
-            ret["rank"] = rank
-            all_summary.append(ret)
-            print("no overlap comm op:\n", nooverlap_comm_df)
-    all_summary_df = pd.DataFrame(all_summary)
-    print(all_summary_df)
-    if args.all_summary_path:
-        with open(args.all_summary_path, "w") as fout:
-            all_summary_df.to_csv(fout, index=False)
-    # check if all kernels start at the same time
-    kernel_start_times = np.asarray(kernel_start_times)
-    min_start_time = np.min(kernel_start_times)
-    print(kernel_start_times - min_start_time)
+    if len(args.json_files) == 1 and "*" in args.json_files[0]:
+        filenames = glob.glob(args.json_files[0])
+    else:
+        filenames = args.json_files
+    if args.process_num > 1:
+        pool = Pool(args.process_num)
+        multi_result = pool.map(parse_trace_file, filenames)
+        for summary, kernel_start_time in multi_result:
+            all_summary.append(summary)
+            kernel_start_times.append(kernel_start_time)
+    else:
+        for json_file in filenames:
+            summary, kernel_start_time = parse_trace_file(json_file)
+            all_summary.append(summary)
+            kernel_start_times.append(kernel_start_time)
+    print_profiler_summary(all_summary, kernel_start_times)
 
 
 if __name__ == "__main__":

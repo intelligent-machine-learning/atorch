@@ -27,9 +27,9 @@ COMMON_TO_MEGATRON_ARG_MAP = {
     "eval_steps": "eval_interval",
     "test_steps": "test_interval",
     "tensorboard_dir": "tensorboard_dir",
-    # "manual_gc": "manual_gc",
-    # "manual_gc_interval": "manual_gc_interval",
-    # "manual_gc_eval": "manual_gc_eval",
+    "manual_gc": "manual_gc",
+    "manual_gc_interval": "manual_gc_interval",
+    "manual_gc_eval": "manual_gc_eval",
     # torch init process
     # Comment the following two lines temporarily.
     # "ddp_backend": "distributed_backend",
@@ -79,9 +79,14 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
     debug_switch: dict = field(
         default_factory=dict,
         metadata={
-            "help": "switches to enable some features for debugging, " "supported features: " " - log_torch_save: True"
+            "help": "switches to enable some features for debugging, "
+            "supported features: "
+            " - log_torch_save: True "
+            " - print_config: True"
         },
     )
+
+    debug_module: bool = field(default=False, metadata={"help": "Open module debug tool."})
 
     flash_checkpoint: bool = field(
         default=False,
@@ -134,6 +139,7 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
         default=None,
         metadata={"help": "The path to a folder with a valid checkpoint for your model."},
     )
+    resume_strict: Optional[bool] = field(default=True, metadata={"help": "Whether to load checkpoint strictly."})
     do_train: bool = field(default=False, metadata={"help": "Whether to run training."})
     do_eval: bool = field(default=False, metadata={"help": "Whether to run eval on the dev set."})
 
@@ -257,6 +263,8 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
             "Virtualize optimizer to reduce the number of GPUs required for validating hybrid parallel strategies."
         },
     )
+    memory_snapshot_path: Optional[str] = field(default=None, metadata={"help": "The path to save memory snapshot."})
+    memory_snapshot_step: Optional[int] = field(default=1, metadata={"help": "The step to save memory snapshot."})
 
     safe_serialization: Optional[bool] = field(default=True)
 
@@ -283,6 +291,15 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
 
     extra_save_frequency_in_epoch: Optional[List[Union[int, float]]] = field(
         default=None, metadata={"help": "Save frequency in each epoch."}
+    )
+
+    """ <dynamic_save_config_path> file content:
+    {
+        "save_at_dynamic_steps": [1000]
+    }
+    """
+    dynamic_save_config_path: Optional[str] = field(
+        default=None, metadata={"help": "The file path to monitor whether to save checkpoint at any time."}
     )
 
     # Evaluation
@@ -589,7 +606,7 @@ class AtorchTrainingArgs(DataclassMixin, AutoMapperExtraConfigs):
             raise ValueError("`gradient_accumulation_steps` is invalid in Megatron training mode.")
 
         if self.finetune_type == "dpo" and self.custom_dpo_infer_function is None:
-            raise ValueError("Arg `custom_dpo_infer_function` should be provided when training DPO task.")
+            logger.warning("Arg `custom_dpo_infer_function` should be provided when training DPO task.")
 
         if len(self.debug_switch) > 0:
             log_torch_save = self.debug_switch.get("log_torch_save", False)
@@ -839,6 +856,20 @@ class MegatronArgs(DynamicDataClass):
     extra_args_provider: Optional[Callable] = field(
         default=None,
         metadata={"help": "Custom args, as a complement for Megatron-LM arguments."},
+    )
+
+    # args for function megatron/training/initialize::initialize_megatron()
+    get_embedding_ranks: Optional[Callable] = field(
+        default=None,
+        metadata={"help": "A function to get the embedding ranks."},
+    )
+    get_position_embedding_ranks: Optional[Callable] = field(
+        default=None,
+        metadata={"help": "A function to get the position embedding ranks."},
+    )
+    get_output_layer_ranks: Optional[Callable] = field(
+        default=None,
+        metadata={"help": "A function to get the output layer ranks."},
     )
 
     def __init__(self, **kwargs):
