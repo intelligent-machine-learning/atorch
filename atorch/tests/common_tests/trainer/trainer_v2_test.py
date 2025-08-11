@@ -49,7 +49,7 @@ if is_megatron_lm_available():
 
     from atorch.trainer.megatron import MegatronTrainStep  # noqa: E402
 else:
-    pytest.skip("rmegatron not available.", allow_module_level=True)
+    pytest.skip("megatron not available.", allow_module_level=True)
 
 
 def model_provider(pre_process=True, post_process=True) -> Union["GPTModel", "megatron.legacy.model.GPTModel"]:

@@ -59,7 +59,7 @@ if is_megatron_lm_available():
 
     from atorch.trainer.megatron import MegatronTrainStep  # noqa: E402
 else:
-    pytest.skip("rmegatron not available.", allow_module_level=True)
+    pytest.skip("megatron not available.", allow_module_level=True)
 
 if is_coverage_available():
     import coverage

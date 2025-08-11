@@ -28,6 +28,8 @@ if is_megatron_lm_available():
         MegatronDataloaderWrapper,
         skip_first_batches_for_megatron_dataloader,
     )
+else:
+    pytest.skip("megatron not available.", allow_module_level=True)
 
 
 class DummyDataset(Dataset):
