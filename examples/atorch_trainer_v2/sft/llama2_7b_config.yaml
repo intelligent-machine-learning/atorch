@@ -1,24 +1,28 @@
 ## training args
+finetune_type: sft
+model_name_or_path: /tmp/llama2_atorch_trainer_pretrained
+dataset_path: /dnn_training_sys/dataset/nlp/alpaca/alpaca_data_cleaned.json
+block_size: 4096
+
 output_dir: !ENV ${OUTPUT_DIR}
-overwrite_output_dir: True
-# resume_from_checkpoint: !ENV ${OUTPUT_DIR}
+# overwrite_output_dir: True
+resume_from_checkpoint: !ENV ${OUTPUT_DIR}
 # flash_checkpoint: True
 do_train: True
 do_eval: True
 distributed_type: "megatron"
 num_train_epochs: 6
-block_size: 512
-per_device_train_batch_size: 2
-per_device_eval_batch_size: 2
+# per_device_train_batch_size: 2
+# per_device_eval_batch_size: 2
 preprocessing_num_workers: 6
 learning_rate: 2.0e-5
 weight_decay: 0.0
 warmup_ratio: 0.03
-seed: 42
+seed: 1403
 max_grad_norm: 0
 bf16: True
-save_strategy: "samples"  # "no" "epoch" "steps" "samples"
-save_samples: 240
+save_strategy: "steps"  # "no" "epoch" "steps" "samples"
+# save_samples: 240
 save_steps: 1000
 save_total_limit: 3
 evaluation_strategy: "steps"  # "no" "epoch" "steps" "samples"
@@ -32,13 +36,13 @@ tensorboard_dir: !ENV ${OUTPUT_DIR}/runs/${TIME_STAMP}
 dataloader_num_workers: 0
 gradient_checkpointing: True
 
-extra_save_frequency_in_epoch:
-  - 0.2
-  - 0.4
+extra_save_frequency_in_epoch: [10, 50]
 
 ## data args
 data_path: &data_path /hetero_infer/jinshi.cl/code/Megatron-LM-core_r0.6.0/wikitext-2-raw-v1-llama2/llama2_tokenized_train_text_document
 tokenizer_model: &tokenizer_model /hetero_infer/jinshi.cl/code/tokenizers/llama_tokenizer/tokenizer.model
+
+dynamic_save_config_path: /tmp/dynamic_save_config.json
 
 ## profiling args
 # profiler_type: nv
@@ -48,6 +52,8 @@ tokenizer_model: &tokenizer_model /hetero_infer/jinshi.cl/code/tokenizers/llama_
 # profiler_schedule_active: 1
 # profiler_schedule_repeat: 1
 # profiler_schedule_skip_first: 20
+
+use_deterministic_algorithms: true
 
 extra_configs:
   model_type_name: "llama"
@@ -79,19 +85,21 @@ extra_configs:
   pretraining_flag: False
   use_mcore_models: True
   transformer_impl: "transformer_engine"
-  micro_batch_size: 2
-  global_batch_size: 16
+  micro_batch_size: 1
+  global_batch_size: 8
   add_bias_linear: False
   bias_gelu_fusion: False
   recompute_activations: True
   recompute_granularity: "selective"
-  train_iters: 10000
+  # train_iters: 10000
   eval_iters: 50
-  tensor_model_parallel_size: 2
-  pipeline_model_parallel_size: 2
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 4
+  num_virtual_stages_per_pipeline_rank: 4
   sequence_parallel: True
   distributed_backend: "nccl"
   use_distributed_optimizer: True
+  overlap_grad_reduce: true
   enable_one_logger: False
   log_timers_to_tensorboard: True
   log_validation_ppl_to_tensorboard: True

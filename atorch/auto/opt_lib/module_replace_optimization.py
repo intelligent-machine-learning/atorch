@@ -67,13 +67,15 @@ register_replace_pair("LayerNorm_Apex", kwargs={"init_from_attr": True}, pair_cl
 
 # decorator mode register. Not doing this in cls definition
 # because importing `register_replace_pair` there incurs circular import
-register_replace_pair("HF_BertAttention_FA", supported_dtypes={torch.float16, torch.bfloat16})(BertAttentionFA)
-register_replace_pair("HF_CLIPAttention_FA", supported_dtypes={torch.float16, torch.bfloat16})(CLIPAttentionFA)
-register_replace_pair("MultiheadAttention_FA", supported_dtypes={torch.float16, torch.bfloat16})(MultiheadAttentionFA)
 if package_version_smaller_than("transformers", "4.38.0"):
-    # transformers 4.38.0 changed LlamaAttention interface, so check version first.
+    # Not support new transformer version, thus only apply to older version.
     register_replace_pair("HF_LlamaAttention_FA", supported_dtypes={torch.float16, torch.bfloat16})(LlamaAttentionFA)
-register_replace_pair("HF_GPT2Attention_FA", supported_dtypes={torch.float16, torch.bfloat16})(GPT2AttentionFA)
+    register_replace_pair("HF_BertAttention_FA", supported_dtypes={torch.float16, torch.bfloat16})(BertAttentionFA)
+    register_replace_pair("HF_CLIPAttention_FA", supported_dtypes={torch.float16, torch.bfloat16})(CLIPAttentionFA)
+    register_replace_pair("MultiheadAttention_FA", supported_dtypes={torch.float16, torch.bfloat16})(
+        MultiheadAttentionFA
+    )
+    register_replace_pair("HF_GPT2Attention_FA", supported_dtypes={torch.float16, torch.bfloat16})(GPT2AttentionFA)
 
 
 def _check_model_params_device(model):

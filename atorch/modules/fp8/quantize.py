@@ -130,33 +130,45 @@ def get_linear_tileblock_quantize_params(block_size):
 class Fp8Quantization:
     E4M3_MAX_POS = torch.finfo(torch.float8_e4m3fn).max if hasattr(torch, "float8_e4m3fn") else 448.0
     E5M2_MAX_POS = torch.finfo(torch.float8_e5m2).max if hasattr(torch, "float8_e5m2") else 57344.0
-    EPS: float = 1e-12
 
     @staticmethod
-    def _amax_to_scale(amax: torch.Tensor, float8_dtype: torch.dtype) -> torch.Tensor:
+    def _amax_to_scale(amax: torch.Tensor, float8_dtype: torch.dtype, eps: float = 0.0) -> torch.Tensor:
         with torch.no_grad():
-            amax = amax.float()
+            amax = torch.clamp(amax.float(), min=eps)
+            if amax.numel() == 1:
+                if amax == 0.0:
+                    amax.fill_(1.0)
+            else:
+                amax[amax == 0.0] = 1.0
+
             if float8_dtype == torch.float8_e4m3fn:
-                res = Fp8Quantization.E4M3_MAX_POS / torch.clamp(amax, min=Fp8Quantization.EPS)
+                res = Fp8Quantization.E4M3_MAX_POS / amax
             else:  # e5m2
-                res = Fp8Quantization.E5M2_MAX_POS / torch.clamp(amax, min=Fp8Quantization.EPS)
+                res = Fp8Quantization.E5M2_MAX_POS / amax
             return res
 
     @staticmethod
     def quantize_tensorwise(
-        x: torch.Tensor, float8_dtype: torch.dtype, method: ScaleComputMethod = ScaleComputMethod.DEFAULT
+        x: torch.Tensor,
+        float8_dtype: torch.dtype,
+        method: ScaleComputMethod = ScaleComputMethod.DEFAULT,
+        eps: float = 0.0,
     ):
         if method == ScaleComputMethod.DEFAULT or method == ScaleComputMethod.PYTORCH:
-            return Fp8Quantization.quantize_tensorwise_pt(x, float8_dtype)
+            return Fp8Quantization.quantize_tensorwise_pt(x, float8_dtype, eps)
         else:
             assert 0, f"{ScaleComputMethod} not implemented"
 
     @staticmethod
     def quantize_axiswise(
-        x: torch.Tensor, float8_dtype: torch.dtype, dim=1, method: ScaleComputMethod = ScaleComputMethod.DEFAULT
+        x: torch.Tensor,
+        float8_dtype: torch.dtype,
+        dim=1,
+        method: ScaleComputMethod = ScaleComputMethod.DEFAULT,
+        eps: float = 0.0,
     ):
         if method == ScaleComputMethod.DEFAULT or method == ScaleComputMethod.PYTORCH or x.dtype == torch.float16:
-            return Fp8Quantization.quantize_axiswise_pt(x, float8_dtype, dim)
+            return Fp8Quantization.quantize_axiswise_pt(x, float8_dtype, dim, eps)
         else:
             assert 0, f"{ScaleComputMethod} not implemented"
 
@@ -167,10 +179,11 @@ class Fp8Quantization:
         block_size,
         method: ScaleComputMethod = ScaleComputMethod.DEFAULT,
         return_transpose=False,
+        eps=0.0,
     ):
         # Only CUTLASS kernel supports return_transpose
         if method == ScaleComputMethod.DEFAULT or method == ScaleComputMethod.TRITON:
-            return Fp8Quantization.quantize_tilewise_triton(x, float8_dtype, block_size=block_size)
+            return Fp8Quantization.quantize_tilewise_triton(x, float8_dtype, block_size=block_size, eps=eps)
         elif (
             method == ScaleComputMethod.CUTLASS
             or method == ScaleComputMethod.CUBLAS
@@ -180,6 +193,7 @@ class Fp8Quantization:
                 x,
                 float8_dtype,
                 block_size=block_size,
+                eps=eps,
                 return_transpose=return_transpose,
                 use_cublas=(method != ScaleComputMethod.CUTLASS),
             )
@@ -193,6 +207,7 @@ class Fp8Quantization:
         block_size,
         method: ScaleComputMethod = ScaleComputMethod.DEFAULT,
         return_transpose=False,
+        eps=0.0,
     ):
         # Only CUTLASS kernel supports return_transpose
         if (
@@ -203,12 +218,13 @@ class Fp8Quantization:
             # Only support square block shape
             assert isinstance(block_size, int) or block_size[0] == block_size[1]
             bsize = block_size if isinstance(block_size, int) else block_size[0]
-            return Fp8Quantization.quantize_blockwise_triton(x, float8_dtype, block_size=bsize)
+            return Fp8Quantization.quantize_blockwise_triton(x, float8_dtype, block_size=bsize, eps=eps)
         elif method == ScaleComputMethod.CUTLASS or method == ScaleComputMethod.CUBLAS:
             return Fp8Quantization.quantize_blockwise_cuda(
                 x,
                 float8_dtype,
                 block_size=block_size,
+                eps=eps,
                 return_transpose=return_transpose,
                 use_cublas=method == ScaleComputMethod.CUBLAS,
             )
@@ -216,52 +232,62 @@ class Fp8Quantization:
             assert 0, f"{ScaleComputMethod} not implemented"
 
     @staticmethod
-    def quantize_tensorwise_pt(x: torch.Tensor, float8_dtype: torch.dtype):
+    def quantize_tensorwise_pt(x: torch.Tensor, float8_dtype: torch.dtype, eps=0.0):
         amax = torch.max(torch.abs(x))
-        scale = Fp8Quantization._amax_to_scale(amax, float8_dtype)
+        scale = Fp8Quantization._amax_to_scale(amax, float8_dtype, eps)
         x_fp8 = (x * scale).to(float8_dtype)
         inverse_scale = scale.reciprocal()
         return x_fp8, inverse_scale
 
     @staticmethod
-    def quantize_axiswise_pt(x: torch.Tensor, float8_dtype: torch.dtype, dim=1):
+    def quantize_axiswise_pt(x: torch.Tensor, float8_dtype: torch.dtype, dim=1, eps=0.0):
         # set dim=1 for rowwise, dim=0 for colwise.
         amax = torch.max(torch.abs(x), dim=dim, keepdim=True).values
-        scale = Fp8Quantization._amax_to_scale(amax, float8_dtype)
+        scale = Fp8Quantization._amax_to_scale(amax, float8_dtype, eps)
         x_fp8 = (x * scale).to(float8_dtype)
         inverse_scale = scale.reciprocal()
         return x_fp8, inverse_scale
 
     @staticmethod
-    def quantize_tilewise_triton(x: torch.Tensor, float8_dtype: torch.dtype, block_size=128):
+    def quantize_tilewise_triton(x: torch.Tensor, float8_dtype: torch.dtype, block_size=128, eps=0.0):
         from .triton_kernel import tile_quant
 
-        return tile_quant(x, dtype=float8_dtype, block_size=block_size)
+        return tile_quant(x, dtype=float8_dtype, block_size=block_size, eps=eps)
 
     @staticmethod
     def quantize_tilewise_cuda(
-        x: torch.Tensor, float8_dtype: torch.dtype, block_size=128, return_transpose=False, use_cublas=False
+        x: torch.Tensor, float8_dtype: torch.dtype, block_size=128, eps=0.0, return_transpose=False, use_cublas=False
     ):
         from .cuda_kernel import tile_quant
 
         return tile_quant(
-            x, dtype=float8_dtype, block_size=block_size, return_transpose=return_transpose, use_cublas=use_cublas
+            x,
+            dtype=float8_dtype,
+            block_size=block_size,
+            eps=eps,
+            return_transpose=return_transpose,
+            use_cublas=use_cublas,
         )
 
     @staticmethod
-    def quantize_blockwise_triton(x: torch.Tensor, float8_dtype: torch.dtype, block_size=128):
+    def quantize_blockwise_triton(x: torch.Tensor, float8_dtype: torch.dtype, block_size=128, eps=0.0):
         from .triton_kernel import block_quant
 
-        return block_quant(x, dtype=float8_dtype, block_size=block_size)
+        return block_quant(x, dtype=float8_dtype, block_size=block_size, eps=eps)
 
     @staticmethod
     def quantize_blockwise_cuda(
-        x: torch.Tensor, float8_dtype: torch.dtype, block_size=128, return_transpose=False, use_cublas=False
+        x: torch.Tensor, float8_dtype: torch.dtype, block_size=128, eps=0.0, return_transpose=False, use_cublas=False
     ):
         from .cuda_kernel import block_quant
 
         return block_quant(
-            x, dtype=float8_dtype, block_size=block_size, return_transpose=return_transpose, use_cublas=use_cublas
+            x,
+            dtype=float8_dtype,
+            block_size=block_size,
+            eps=eps,
+            return_transpose=return_transpose,
+            use_cublas=use_cublas,
         )
 
 
@@ -276,6 +302,7 @@ def get_fp8_quantize_underflows(
     blockwise_required=True,
     block_size=128,
     quantize_method="DEFAULT",
+    eps=0.0,
 ):
     # Return a dict of underflow percentages for different quantize methods.
     if fp8_dtype is None:
@@ -283,25 +310,32 @@ def get_fp8_quantize_underflows(
     data = data.contiguous().view(-1, data.shape[-1])
     total_zero = (data == 0).sum().item()
     total_nonzero = data.numel() - total_zero
+
     results = {}
     if tensorwise_required:
-        tensor_fp8, _ = Fp8Quantization.quantize_tensorwise(data, fp8_dtype)
+        tensor_fp8, _ = Fp8Quantization.quantize_tensorwise(data, fp8_dtype, eps=eps)
         tensor_zero = (tensor_fp8 == 0).sum().item()
-        tenor_underflow = (tensor_zero - total_zero) / total_nonzero * 100.0
+        tenor_underflow = 0
+        if total_nonzero > 0:
+            tenor_underflow = (tensor_zero - total_zero) / total_nonzero * 100.0
         results["tensorwise"] = tenor_underflow
     if rowwise_required:
         row_fp8, _ = Fp8Quantization.quantize_axiswise(
             data, fp8_dtype, dim=1, method=ScaleComputMethod(quantize_method)
         )
         row_zero = (row_fp8 == 0).sum().item()
-        row_underflow = (row_zero - total_zero) / total_nonzero * 100.0
+        row_underflow = 0
+        if total_nonzero > 0:
+            row_underflow = (row_zero - total_zero) / total_nonzero * 100.0
         results["rowwise"] = row_underflow
     if colwise_required:
         col_fp8, _ = Fp8Quantization.quantize_axiswise(
             data, fp8_dtype, dim=0, method=ScaleComputMethod(quantize_method)
         )
         col_zero = (col_fp8 == 0).sum().item()
-        col_underflow = (col_zero - total_zero) / total_nonzero * 100.0
+        col_underflow = 0
+        if total_nonzero > 0:
+            col_underflow = (col_zero - total_zero) / total_nonzero * 100.0
         results["colwise"] = col_underflow
 
     padded_tensor = data
@@ -312,25 +346,31 @@ def get_fp8_quantize_underflows(
 
     if tilewise_required:
         tile_fp8, _ = Fp8Quantization.quantize_tilewise(
-            padded_tensor, fp8_dtype, block_size, method=ScaleComputMethod(quantize_method)
+            padded_tensor, fp8_dtype, block_size, eps=eps, method=ScaleComputMethod(quantize_method)
         )
         tile_zero = (tile_fp8 == 0).sum().item()
-        tile_underflow = (tile_zero - total_zero) / total_nonzero * 100.0
+        tile_underflow = 0
+        if total_nonzero > 0:
+            tile_underflow = (tile_zero - total_zero) / total_nonzero * 100.0
         results["tilewise"] = tile_underflow
 
     if v_tilewise_required:
         tile_fp8, _ = Fp8Quantization.quantize_tilewise(
-            padded_tensor.t().contiguous(), fp8_dtype, block_size, method=ScaleComputMethod(quantize_method)
+            padded_tensor.t().contiguous(), fp8_dtype, block_size, eps=eps, method=ScaleComputMethod(quantize_method)
         )
         tile_zero = (tile_fp8 == 0).sum().item()
-        tile_underflow = (tile_zero - total_zero) / total_nonzero * 100.0
+        tile_underflow = 0
+        if total_nonzero > 0:
+            tile_underflow = (tile_zero - total_zero) / total_nonzero * 100.0
         results["v_tilewise"] = tile_underflow
 
     if blockwise_required:
         block_fp8, _ = Fp8Quantization.quantize_blockwise(
-            padded_tensor, fp8_dtype, block_size, method=ScaleComputMethod(quantize_method)
+            padded_tensor, fp8_dtype, block_size, eps=eps, method=ScaleComputMethod(quantize_method)
         )
         block_zero = (block_fp8 == 0).sum().item()
-        block_underflow = (block_zero - total_zero) / total_nonzero * 100.0
+        block_underflow = 0
+        if total_nonzero > 0:
+            block_underflow = (block_zero - total_zero) / total_nonzero * 100.0
         results["blockwise"] = block_underflow
     return results

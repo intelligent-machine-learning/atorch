@@ -1,20 +1,13 @@
+import functools
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import torch
 from torch import distributed as dist
 from torch import nn
 
 from atorch.communication.pipe_communicator import PipeCommunicator
-from atorch.utils.version import torch_version
-
-logger = logging.getLogger(__name__)
-
-_is_torch_version_smaller_than_25 = False
-if torch_version() < (2, 5, 0):  # type: ignore
-    _is_torch_version_smaller_than_25 = True
-else:
-    _is_torch_version_smaller_than_25 = False
+from atorch.utils.version import torch_version as get_torch_version
 
 try:
     from torch.distributed.pipelining._debug import map_debug_info
@@ -23,6 +16,9 @@ try:
 except (ImportError, ModuleNotFoundError):
     _PipelineStageBase = object
     map_debug_info, flatten_args = None, None
+
+torch_version = cast(Tuple[int, ...], get_torch_version())
+logger = logging.getLogger(__name__)
 
 
 class PipeStage(_PipelineStageBase):
@@ -61,7 +57,7 @@ class PipeStage(_PipelineStageBase):
     ):
         pass
 
-    def _prepare_forward_infra(self, num_microbatches: int) -> None:
+    def _prepare_forward_infra(self, num_microbatches: int, *args, **kwargs) -> None:
         pass
 
     def _prepare_backward_infra(self, num_microbatches: int):
@@ -222,7 +218,13 @@ class PipeStage(_PipelineStageBase):
 
         return output
 
-    def backward_one_chunk(self, bwd_chunk_id: int, loss=None, full_backward: bool = True):
+    def backward_one_chunk(
+        self,
+        bwd_chunk_id: int,
+        loss=None,
+        full_backward: bool = True,
+        last_backward: Optional[bool] = None,
+    ):
         """
         Perform backward pass on the module.
         This should only be called once per microbatch.
@@ -255,24 +257,30 @@ class PipeStage(_PipelineStageBase):
                 "input_values": input_values,
             }
 
-        if _is_torch_version_smaller_than_25:
+        if torch_version < (2, 5):
             assert full_backward, "only full_backward=True is supported"
             self.grads_input = self.backward_maybe_with_nosync(bwd_kwargs)
         else:
             assert self.dw_builder is None, "Not support dw builder"
-
+            if torch_version < (2, 7):
+                backward_maybe_with_nosync = self.backward_maybe_with_nosync
+            else:
+                assert last_backward is not None
+                backward_maybe_with_nosync = functools.partial(
+                    self.backward_maybe_with_nosync, last_backward=last_backward
+                )
             # Save full_backward
             bwd_kwargs["full_backward"] = full_backward
 
             if full_backward:
-                self.grads_input, _ = self.backward_maybe_with_nosync("full", bwd_kwargs)
+                self.grads_input, _ = backward_maybe_with_nosync("full", bwd_kwargs)
             else:
                 # perform the partial backwards for the inputs with a custom backward function
                 # when the "stage_ouput" is a loss, then it is a tensor, otherwise it is a tuple of tensors
                 if isinstance(bwd_kwargs["stage_output"], torch.Tensor):
                     bwd_kwargs["stage_output"] = (bwd_kwargs["stage_output"],)
 
-                self.grads_input, param_groups = self.backward_maybe_with_nosync("input", bwd_kwargs)
+                self.grads_input, param_groups = backward_maybe_with_nosync("input", bwd_kwargs)
 
                 # TODO: we dont need to save this, add to dw_runner?
                 self.backward_state[bwd_chunk_id] = (

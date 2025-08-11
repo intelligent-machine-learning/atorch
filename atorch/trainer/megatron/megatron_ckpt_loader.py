@@ -18,6 +18,7 @@ class MegatronCkptLoader(CkptLoader):
         optimizer=None,
         scheduler=None,
         train_args: AtorchTrainingArgs = None,
+        **kwargs,
     ) -> Tuple[int, int]:
         pass
 
@@ -30,6 +31,7 @@ class MegatronOriginSyncLoader(MegatronCkptLoader):
         optimizer=None,
         scheduler=None,
         train_args: AtorchTrainingArgs = None,
+        **kwargs,
     ):
         assert model is not None, "Megatron load model should not be None"
         assert optimizer is not None, "Megatron load optimizer should not be None"
@@ -46,7 +48,9 @@ class MegatronOriginSyncLoader(MegatronCkptLoader):
 
         from megatron.training.checkpointing import load_checkpoint
 
-        iteration, num_floating_point_operations_so_far = load_checkpoint(model, optimizer, scheduler)
+        iteration, num_floating_point_operations_so_far = load_checkpoint(
+            model, optimizer, scheduler, strict=train_args.resume_strict
+        )  # pragma: no cover
 
         torch.distributed.barrier()
 

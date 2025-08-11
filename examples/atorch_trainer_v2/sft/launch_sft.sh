@@ -1,13 +1,19 @@
 #!/bin/bash
 set -exo pipefail
 
+# GPU
+# pip install deprecated tensorboard h5py
+
+# PPU
+# pip install scipy tensorboardX mdatasets nltk h5py
+
 CONFIG_PATH=${1:-"$(dirname $0)/llama2_7b_config.yaml"}
 
-MEGATRON_BRANCH=${MEGATRON_BRANCH:-core_r0.11.0}
-MEGATRON_PATH=/tmp/Megatron-LM-${MEGATRON_BRANCH}
+MEGATRON_TAG=${MEGATRON_TAG:-ant_release_0.11.0_v1.6.0}
+MEGATRON_PATH=/tmp/Megatron-LM-${MEGATRON_TAG}
 if [ ! -d ${MEGATRON_PATH} ]; then
     pushd $(dirname ${MEGATRON_PATH})
-    git clone -b ${MEGATRON_BRANCH} https://code.alipay.com/Arc/Megatron-LM.git $(basename ${MEGATRON_PATH})
+    git clone -b ${MEGATRON_TAG} https://code.alipay.com/Arc/Megatron-LM.git $(basename ${MEGATRON_PATH})
     popd
 fi
 
@@ -57,7 +63,7 @@ else
     "
 fi
 
-CMD="${LAUNCHER[@]} $(dirname $0)/pretrain_atorch_trainer_megatron.py ${CONFIG_PATH}"
+CMD="${LAUNCHER[@]} $(dirname $0)/sft_atorch_trainer_megatron.py ${CONFIG_PATH}"
 
 echo ${CMD}
 ${CMD} 2>&1 | tee ${OUTPUT_DIR}/node_${NODE_RANK}_${TIME_STAMP}.log

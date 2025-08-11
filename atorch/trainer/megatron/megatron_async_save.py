@@ -89,6 +89,7 @@ class MegatronAsyncCkptSaver(MegatronCkptSaver):
         optimizer=None,
         scheduler=None,
         num_floating_point_operations_so_far=None,
+        **kwargs,
     ):
         megatron_args = get_args()
         async_timeout = train_args.flash_checkpoint_timeout

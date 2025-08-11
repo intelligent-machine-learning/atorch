@@ -128,6 +128,9 @@ class TestScaledLinear(unittest.TestCase):
         data[0][0] = 10000.0
         results = get_fp8_quantize_underflows(data)
         self.assertTrue("tilewise" in results and "blockwise" in results)
+        data = torch.zeros(128 * 4 - 3, 128 * 4, device="cuda", dtype=torch.bfloat16)
+        results = get_fp8_quantize_underflows(data)
+        self.assertTrue("tilewise" in results and "blockwise" in results)
 
     def switch_precision(self):
         layer_num = 6
@@ -251,6 +254,9 @@ class TestScaledLinear(unittest.TestCase):
         model2 = ScaledLinear(K, N, bias=False, device="cuda", dtype=dtype, quantize_params=tileblock_triton_qparams)
         from atorch.modules.fp8.cuda_kernel import fp8_cutlass_cublas_ops_available
 
+        model3 = None
+        model4 = None
+        model5 = None
         if fp8_cutlass_cublas_ops_available():
             model3 = ScaledLinear(
                 K, N, bias=False, device="cuda", dtype=dtype, quantize_params=tileblock_cutlass_qparams
@@ -263,11 +269,6 @@ class TestScaledLinear(unittest.TestCase):
                 model5 = ScaledLinear(
                     K, N, bias=False, device="cuda", dtype=dtype, quantize_params=tileblock_deep_gemm_qparams
                 )
-            else:
-                model5 = None
-        else:
-            model3 = None
-            model4 = None
 
         model.set_use_fp8(False)
         with torch.no_grad():

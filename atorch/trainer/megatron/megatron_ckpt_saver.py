@@ -2,6 +2,7 @@ import os
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any, Callable, Dict, Optional
 
 import torch
 from megatron.training import get_args
@@ -58,11 +59,15 @@ class MegatronCkptSaver(CkptSaver, ABC):
         optimizer=None,
         scheduler=None,
         num_floating_point_operations_so_far=None,
+        **kwargs,
     ):
         pass
 
 
 class MegatronOriginSaver(MegatronCkptSaver):
+
+    _checkpointing_context: Optional[Dict] = None
+
     def save(  # type: ignore[override]
         self,
         iteration: int,
@@ -73,12 +78,16 @@ class MegatronOriginSaver(MegatronCkptSaver):
         optimizer=None,
         scheduler=None,
         num_floating_point_operations_so_far=None,
+        **kwargs,
     ):
 
         megatron_args = get_args()
 
         if output_dir is not None:
             megatron_args.save = output_dir
+
+        if megatron_args.ckpt_assume_constant_structure and MegatronOriginSaver._checkpointing_context is None:
+            MegatronOriginSaver._checkpointing_context = {}
 
         if is_main_process():
             checkpoint_dir_path = self.get_interation_path(output_dir, iteration, return_base_dir=True)
@@ -91,12 +100,22 @@ class MegatronOriginSaver(MegatronCkptSaver):
 
         from megatron.training.checkpointing import save_checkpoint
 
+        extra_args: Dict[str, Any] = {}
+
+        custom_async_finalize_fn: Callable = (
+            kwargs["custom_async_finalize_fn"] if "custom_async_finalize_fn" in kwargs else None
+        )
+        if custom_async_finalize_fn is not None:
+            extra_args.update(custom_async_finalize_fn=custom_async_finalize_fn)
+
         save_checkpoint(
             iteration,
             module,
             optimizer,
             scheduler,
             num_floating_point_operations_so_far=num_floating_point_operations_so_far,
+            checkpointing_context=MegatronOriginSaver._checkpointing_context,
+            **extra_args,
         )
 
         torch.distributed.barrier()
