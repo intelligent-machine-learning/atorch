@@ -22,7 +22,6 @@ python_version = sys.version_info
 from atorch.common.util_func import find_free_port  # noqa: E402
 from atorch.trainer.args import AtorchTrainingArgs  # noqa: E402
 from atorch.trainer.atorch_trainer_v2 import AtorchTrainerV2  # noqa: E402
-from atorch.trainer.megatron import MegatronTrainStep  # noqa: E402
 from atorch.trainer.utils import DistributedType  # noqa: E402
 from atorch.utils.import_util import is_megatron_lm_available  # noqa: E402
 from atorch.utils.version import is_megatron_version_bigger_than, torch_version  # noqa: E402
@@ -49,6 +48,10 @@ if is_megatron_lm_available():
         get_batch_on_this_tp_rank,
     )
     from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+
+    from atorch.trainer.megatron import MegatronTrainStep  # noqa: E402
+else:
+    pytest.skip("rmegatron not available.", allow_module_level=True)
 
 
 def model_provider(pre_process=True, post_process=True) -> Union["GPTModel", "megatron.legacy.model.GPTModel"]:
