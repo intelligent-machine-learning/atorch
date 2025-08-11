@@ -26,8 +26,6 @@ from atorch.trainer.utils import DistributedType  # noqa: E402
 from atorch.utils.import_util import is_megatron_lm_available  # noqa: E402
 from atorch.utils.version import is_megatron_version_bigger_than, torch_version  # noqa: E402
 
-assert is_megatron_lm_available(), f"Can't import megatron, PYTHONPATH={os.environ['PYTHONPATH']}"
-
 if is_megatron_lm_available():
     import megatron.legacy.model
     from megatron.core import mpu
