@@ -1,0 +1,32 @@
+[run]
+branch=True
+concurrency=multiprocessing
+parallel = True
+source = ./atorch
+omit =
+    */tests/*
+    */benchmarks/*
+    atorch/modules/normalization/*
+    atorch/npu/*
+    atorch/rl/*
+    atorch/kernels/patches/*
+    atorch/data_parallel/zero_ddp_mix_112.py
+    atorch/data_parallel/adp.py
+    atorch/auto/opt_lib/shard_planners/*
+    atorch/service/*
+    atorch/fault_tolerance/*
+    atorch/auto/engine/sg_algo/hebo/optimizers/*
+    atorch/utils/inspector/analyze_log.py
+    examples/*
+    atorch/trainer/models/atorch_model.py
+    atorch/modules/distributed_modules/compilers/pipe_compiler/*
+    atorch/modules/distributed_modules/compilers/tp_compiler/*
+    atorch/trainer/base/async_save/megatron_async_save/*
+    atorch/trainer/models/atorch_model.py
+    atorch/ops/quantizer/*
+    atorch/data_parallel/auto_wrap.py
+    atorch/trainer/megatron/megatron_async_save.py
+    atorch/utils/ib_monitor.py
+    atorch/utils/numberic_checker.py
+    atorch/utils/parse_trace_json.py
+    atorch/utils/parse_memory_pickle.py
