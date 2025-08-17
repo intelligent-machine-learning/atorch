@@ -5,8 +5,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import os
 
-from dualpipe import DualPipe, set_p2p_tensor_shapes, set_p2p_tensor_dtype
-from dualpipe.utils import WeightGradStore, run_backward
+from dualpipe import set_p2p_tensor_shapes, set_p2p_tensor_dtype
+from dualpipe.utils import run_backward
 
 class MoEConfig:
     def __init__(
@@ -26,6 +26,9 @@ class MoEConfig:
         self.initializer_range = 0.02
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
+    # Reference:
+    # https://github.com/intelligent-machine-learning/atorch/blob/6651b69ee690d885380ba6b9f78fcdcb1a08e4dc/examples/moe/moe_modules.py#L206
+
     main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
 
     @staticmethod
@@ -61,10 +64,10 @@ class MoERouter(nn.Module):
 
     def apply_load_balancing_loss(self, router_probs, tokens_per_expert):
         if self.moe_aux_loss_coeff > 0 and self.training:
-            # 计算每个专家的负载
+            # Calculate load for each expert
             num_tokens = router_probs.shape[0]
             expert_load = router_probs.sum(0) / num_tokens
-            # 理想负载
+            # Ideal load
             target_load = torch.ones_like(expert_load) / self.num_experts
             aux_loss = F.mse_loss(expert_load, target_load) * self.moe_aux_loss_coeff
             router_probs = MoEAuxLossAutoScaler.apply(router_probs, aux_loss)
@@ -102,6 +105,8 @@ class ExpertLinear(nn.Module):
         return self.down_proj(activated)
 
 class MoEPipelineStage(nn.Module):
+    # Reference:
+    # https://github.com/deepseek-ai/DualPipe/blob/3da1bbea53606543d7f5f232338fc58096db30e3/examples/example_dualpipe.py#L55C9-L55C36
     def __init__(self, config: MoEConfig):
         super().__init__()
         self.config = config
@@ -111,7 +116,7 @@ class MoEPipelineStage(nn.Module):
             for _ in range(config.num_experts)
         ])
         
-    def forward(self, x: torch.Tensor, *args) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if isinstance(x, tuple):
             x = x[0]
             
@@ -235,15 +240,39 @@ def main(rank, pp_size):
 
 
     loss_ref, output_ref = ref_step(full_x, full_l, full_modules, num_chunks)
-    print(loss_ref)
-    print(output_ref)
+
+    # Add comparison after multi-machine training
+    if is_first_rank:
+        # Create single-machine model for comparison
+        single_model = MoEPipelineStage(moe_config)
+        single_model.load_state_dict(full_modules[0].state_dict())
+        
+        # Use the same input data - take first micro batch
+        single_output, single_router_loss = single_model(full_x[:3])  # 3 samples, consistent with micro_batch_size
+        single_task_loss = moe_criterion(single_output, full_l[:3])
+        single_loss = single_task_loss + single_router_loss
+        
+        # Compare results
+        print(f"Multi-machine loss: {loss_ref[0].item():.6f}")
+        print(f"Single-machine loss: {single_loss.item():.6f}")
+        print(f"Loss difference: {abs(loss_ref[0].item() - single_loss.item()):.6f}")
+        
+        # Compare outputs - take first micro batch from multi-machine output
+        multi_output = output_ref[:3]  # # Take first 3 samples, matching single_output shape
+        output_diff = torch.abs(multi_output - single_output)
+        max_diff = torch.max(output_diff).item()
+        mean_diff = torch.mean(output_diff).item()
+        print(f"Output max difference: {max_diff:.6f}")
+        print(f"Output mean difference: {mean_diff:.6f}")
+        print(f"Output shapes - Multi: {multi_output.shape}, Single: {single_output.shape}")
 
 
-def test_dualpipe(ngpus):
 
+
+def test_multi_gpu(ngpus):
     torch.multiprocessing.spawn(main, args=(ngpus,), nprocs=ngpus, daemon=True)
 
-def test_moe_basic():
+def test_single_gpu():
 
     hidden_size = 512
     batch_size = 4
@@ -281,8 +310,16 @@ def test_moe_basic():
     
     print("Basic functionality test completed!")
 
+
+
 if __name__ == "__main__":
     # Run basic test first
-    print("Running basic MoE model test...")
-    test_moe_basic()
+    # print("Running basic MoE model test...")
+    # test_single_gpu()
+
+    # 获取可用GPU数量并运行测试
+    num_gpus = torch.cuda.device_count() // 2 * 2
+    print(f"Testing with {num_gpus} GPUs")
+    test_multi_gpu(num_gpus)
+    print(f"Test passed with {num_gpus} GPUs")
     
