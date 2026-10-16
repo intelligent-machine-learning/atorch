@@ -1,12 +1,9 @@
 # auto_accelerate API
 
-ATorch supports efficient and easy-to-use model training experience by decoupling model definition from training optimization strategy. The decoupling ability is provided by auto_accelerate API. 
-The auto_accelerate API provides two ways of usage:
+ATorch supports efficient and easy-to-use model training experience by decoupling model definition from training optimization strategy. The decoupling ability is provided by auto_accelerate API.
+The auto_accelerate API uses semi-automatic mode: users specify the optimization strategy through `load_strategy`, and auto_accelerate automatically configures and implements the optimization strategy.
 
-1. Fully automatic mode: Automatically generates optimization strategy and implements automatic optimization.
-2. Semi-automatic mode: Users specify the method used for optimization strategy through load_strategy, and auto_accelerate automatically configures and implements the optimization strategy.
-
-An optimization strategy consists of multiple optimization methods, including parallel training, GPU memory optimization methods, compute optimization, etc. Supported optimization methods are listed in [doc link](#supported-optimization-methods). 
+An optimization strategy consists of multiple optimization methods, including parallel training, GPU memory optimization methods, compute optimization, etc. Supported optimization methods are listed in [doc link](#supported-optimization-methods).
 
 ## Inputs
 auto_accelerate takes model, optim_func, dataset, loss_func, etc as inputs, and generates optimized model, optimizer, dataloader etc as outputs.
@@ -22,8 +19,6 @@ auto_accelerate(
     optim_param_func=None,
     dataloader_args=None,
     distributed_sampler_cls=None,
-    excluded=None,
-    included=None,
     load_strategy=None,
     lr_scheduler_cls=None,
     lr_scheduler_args=None,
@@ -121,21 +116,9 @@ None: use data as model input.
 "unpack_dict": use **data as model input.</td>
   </tr>
 
-  <tr>
-    <td>excluded (List[str], optional) </td>
-    <td>optimization methods excluded in fully-automatic mode.</td>
-  </tr>
-
-  <tr>
-    <td>included (List[str], optional)</td>
-    <td> (Not supported yet) optimization methods must be included in fully-automatic mode.</td>
-  </tr>
-
 <tr>
-    <td>load_strategy (optional)</td>
-    <td>If None, fully-automatic model.
-
-Not None, semi-automatic model. Supported formats:
+    <td>load_strategy (required)</td>
+    <td>The acceleration strategy to load and apply directly. Must not be None (the automatic strategy search feature has been removed). Supported formats:
 
 1. str: strategy(str)
 
@@ -171,10 +154,6 @@ Not None, semi-automatic model. Supported formats:
   <tr>
     <td>kargs (Dict, optional)</td>
     <td>  Other optional arguments. Supported args:
-
-    "verbose"：(bool) default False. If True, print more info.
-
-    "time_limit"：time limit (second) for fully-automatic mode.
 
     "find_unused_parameters"：(bool): default False. parameters for DDP (when DDP is in optimization methods).
 
@@ -408,5 +387,5 @@ Use DeepSpeed pipeline engine for 3D parallel.
 
 ## Examples
 
-See [auto_accelerate examples](../examples/auto_accelerate/README.md) for detail. Moreover, please refer to [example](../examples/llama2/README.md) for fully automatic mode of auto_accelerate.
+See [auto_accelerate examples](../examples/auto_accelerate/README.md) for detail.
 

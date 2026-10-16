@@ -17,9 +17,7 @@ if [[ ${CUR_PYTHON_VERSION} == "38" ]];then
   cp $PROTOS_DIR/*.proto $PROTOS_DIR/protobuf_3_20_3/
   pushd .
   cd $PROTOS_DIR/protobuf_3_20_3
-  python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ./acceleration.proto
   python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ./coworker.proto
-  sed -i 's/import acceleration_pb2/from \. import acceleration_pb2/g' acceleration_pb2_grpc.py
   sed -i 's/import coworker_pb2/from \. import coworker_pb2/g' coworker_pb2_grpc.py
   rm *.proto
   popd
@@ -32,9 +30,7 @@ pip install protobuf==$PROTOBUF_VERSION_3 grpcio==$GRPCIO_VERSION_3 grpcio-tools
 cp $PROTOS_DIR/*.proto $PROTOS_DIR/protobuf_4_25_3/
 pushd .
 cd $PROTOS_DIR/protobuf_4_25_3
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ./acceleration.proto
 python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ./coworker.proto
-sed -i 's/import acceleration_pb2/from \. import acceleration_pb2/g' acceleration_pb2_grpc.py
 sed -i 's/import coworker_pb2/from \. import coworker_pb2/g' coworker_pb2_grpc.py
 rm *.proto
 popd

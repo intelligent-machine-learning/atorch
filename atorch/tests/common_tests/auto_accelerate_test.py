@@ -66,121 +66,6 @@ def task_run_code(data_size, batch_size):
     atorch.reset_distributed()
 
 
-class FakeEasyDLClient(object):
-    def __init__(self, addr, port):
-        tasks = []
-        task = Task(id=0, task_type="ANALYSE", process_mode="ONE_PROCESS", task_info=["analyse_basic"])
-        tasks.append(task)
-        pg_info = ([("data", 2)], None)
-        task = Task(id=1, task_type="SETUP_PARALLEL_GROUP", process_mode="ALL_PROCESS", task_info=pg_info)
-        tasks.append(task)
-        task = Task(id=2, task_type="WAIT")
-        tasks.append(task)
-        strategy = Strategy([("parallel_mode", pg_info, False)])
-        task = Task(id=3, task_type="DRYRUN", process_mode="ALL_PROCESS", task_info=strategy)
-        tasks.append(task)
-        task = Task(id=4, task_type="FINISH", process_mode="ALL_PROCESS", task_info=strategy)
-        tasks.append(task)
-        self.tasks = tasks
-        self.index = 0
-
-    def get_task(self):
-        if self.index < len(self.tasks):
-            self.index += 1
-            return self.tasks[self.index - 1]
-        return None
-
-    def report_task_result(self, task, status, result):
-        pass
-
-
-class FakeEasyDLClientWithFailTask(FakeEasyDLClient):
-    def __init__(self, addr, port):
-        tasks = []
-        task = Task(id=0, task_type="ANALYSE", process_mode="ONE_PROCESS", task_info=["analyse_basic"])
-        tasks.append(task)
-        task = Task(id=4, task_type="FAIL", process_mode="ALL_PROCESS", task_info=None)
-        tasks.append(task)
-        self.tasks = tasks
-        self.index = 0
-
-
-class FakeEngine(object):
-    def __init__(
-        self,
-        device_context,
-        included_opts=None,
-        excluded_opts=None,
-        load_strategy=None,
-        time_limit=None,
-        verbose=False,
-    ):
-        pass
-
-    def start_service(self, port):
-        pass
-
-    def tear_down(self):
-        pass
-
-
-class FakeEngineManager:
-    def __init__(self, fake_client, fake_engine):
-        from atorch.auto.engine.acceleration_engine import AccelerationEngine
-        from atorch.auto.engine_client import EngineClient
-
-        self.original_client = EngineClient
-        self.original_engine = AccelerationEngine
-        self.fake_client = fake_client
-        self.fake_engine = fake_engine
-
-    def __enter__(self):
-        atorch.auto.engine_client.EngineClient = self.fake_client
-        atorch.auto.engine.acceleration_engine.AccelerationEngine = self.fake_engine
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        atorch.auto.engine_client.EngineClient = self.original_client
-        atorch.auto.engine.acceleration_engine.AccelerationEngine = self.original_engine
-
-
-def func_run_code(data_size, batch_size):
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    res = atorch.init_distributed(backend, set_cuda_device_using_local_rank=True)
-    if not res:
-        raise Exception("init failed")
-    model_context = create_model_context(data_size=data_size, batch_size=batch_size)
-
-    with FakeEngineManager(FakeEasyDLClient, FakeEngine):
-        status, res, best_strategy = auto_accelerate(
-            model_context.model,
-            model_context.optim_func,
-            model_context.dataset,
-            loss_func=model_context.loss_func,
-            prepare_input=model_context.prepare_input,
-            optim_args=model_context.optim_args,
-            dataloader_args=model_context.dataloader_args,
-        )
-    assert len(best_strategy) == 1
-    assert status
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    num = run_train(res.model, res.dataloader, res.optim, res.prepare_input, res.loss_func, device)
-    assert num == data_size // batch_size, f"num={num}"
-
-    model_context = create_model_context(data_size=data_size, batch_size=batch_size)
-    with FakeEngineManager(FakeEasyDLClientWithFailTask, FakeEngine):
-        status, _, _ = auto_accelerate(
-            model_context.model,
-            model_context.optim_func,
-            model_context.dataset,
-            loss_func=model_context.loss_func,
-            prepare_input=model_context.prepare_input,
-            optim_args=model_context.optim_args,
-            dataloader_args=model_context.dataloader_args,
-        )
-    assert status is False
-    atorch.reset_distributed()
-
-
 def save_load_code(data_size, batch_size):
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     res = atorch.init_distributed(backend, set_cuda_device_using_local_rank=True)
@@ -252,40 +137,22 @@ def set_seed_code(data_size, batch_size):
     model_context = create_model_context(data_size=data_size, batch_size=batch_size, sampler_seed=seed)
     assert model_context.sampler_seed == 13
 
-    with FakeEngineManager(FakeEasyDLClient, FakeEngine):
-        status, res, _ = auto_accelerate(
-            model_context.model,
-            model_context.optim_func,
-            model_context.dataset,
-            loss_func=model_context.loss_func,
-            prepare_input=model_context.prepare_input,
-            optim_args=model_context.optim_args,
-            dataloader_args=model_context.dataloader_args,
-        )
+    strategy = Strategy([("parallel_mode", ([("data", 2)], None), False)])
+    status, res, _ = auto_accelerate(
+        model_context.model,
+        model_context.optim_func,
+        model_context.dataset,
+        loss_func=model_context.loss_func,
+        prepare_input=model_context.prepare_input,
+        optim_args=model_context.optim_args,
+        dataloader_args=model_context.dataloader_args,
+        load_strategy=strategy,
+    )
     assert status
     dataloader = res.dataloader
     sampler = dataloader.sampler
-    assert isinstance(sampler, torch.data.utils.distributed.DistributedSampler)
+    assert isinstance(sampler, torch.utils.data.distributed.DistributedSampler)
     assert sampler.seed == seed
-
-
-class FakeEasyDLClientOnlyPass(FakeEasyDLClient):
-    def __init__(self, addr, port):
-        tasks = []
-        task = Task(id=0, task_type="ANALYSE", process_mode="ONE_PROCESS", task_info=["analyse_basic"])
-        tasks.append(task)
-        pg_info = ([("data", 2)], None)
-        task = Task(id=1, task_type="SETUP_PARALLEL_GROUP", process_mode="ALL_PROCESS", task_info=pg_info)
-        tasks.append(task)
-        task = Task(id=2, task_type="WAIT")
-        tasks.append(task)
-        strategy = Strategy([("parallel_mode", pg_info, False)])
-        task = Task(id=3, task_type="DRYRUN", process_mode="ALL_PROCESS", task_info=strategy)
-        tasks.append(task)
-        task = Task(id=4, task_type="FINISH", process_mode="ALL_PROCESS", task_info=strategy)
-        tasks.append(task)
-        self.tasks = tasks
-        self.index = 0
 
 
 def only_pass_model_code(dp_size):
@@ -298,8 +165,7 @@ def only_pass_model_code(dp_size):
     pg_info = ([("data", dp_size)], None)
     strategy = Strategy([("parallel_mode", pg_info, False)])
 
-    with FakeEngineManager(FakeEasyDLClientOnlyPass, FakeEngine):
-        status, res, best_strategy = auto_accelerate(model, load_strategy=strategy)
+    status, res, best_strategy = auto_accelerate(model, load_strategy=strategy)
     assert len(best_strategy) == 1
     assert status
     assert res.model is not None
@@ -308,25 +174,6 @@ def only_pass_model_code(dp_size):
     assert res.prepare_input is data_to_device
     assert res.loss_func is None
     assert best_strategy == strategy
-
-
-class FakeEasyDLClientPassSampleBatch(FakeEasyDLClient):
-    def __init__(self, addr, port):
-        tasks = []
-        task = Task(id=0, task_type="ANALYSE", process_mode="ONE_PROCESS", task_info=["analyse_basic"])
-        tasks.append(task)
-        pg_info = ([("data", 2)], None)
-        task = Task(id=1, task_type="SETUP_PARALLEL_GROUP", process_mode="ALL_PROCESS", task_info=pg_info)
-        tasks.append(task)
-        task = Task(id=2, task_type="WAIT")
-        tasks.append(task)
-        strategy = Strategy([("parallel_mode", pg_info, False)])
-        task = Task(id=3, task_type="DRYRUN", process_mode="ALL_PROCESS", task_info=strategy)
-        tasks.append(task)
-        task = Task(id=4, task_type="FINISH", process_mode="ALL_PROCESS", task_info=strategy)
-        tasks.append(task)
-        self.tasks = tasks
-        self.index = 0
 
 
 def pass_sample_batch_code(dp_size):
@@ -339,8 +186,7 @@ def pass_sample_batch_code(dp_size):
     sample_batch = [torch.ones([batch_size, 16], dtype=torch.float32), torch.ones([batch_size, 4], dtype=torch.float32)]
 
     pg_info = ([("data", dp_size)], None)
-    with FakeEngineManager(FakeEasyDLClientPassSampleBatch, FakeEngine):
-        strategy = Strategy([("parallel_mode", pg_info, False)])
+    strategy = Strategy([("parallel_mode", pg_info, False)])
 
     status, res, best_strategy = auto_accelerate(
         model,
@@ -364,9 +210,6 @@ def pass_sample_batch_code(dp_size):
 class AutoAccelerateTest(unittest.TestCase):
     def test_tasks(self):
         run_dist_code("test_tasks")
-
-    def test_func(self):
-        run_dist_code("test_func")
 
     @unittest.skipIf(
         not torch.cuda.is_available() or torch.cuda.device_count() < 2, "Skip when gpu not exists or only 1 gpu"
@@ -480,8 +323,6 @@ if __name__ == "__main__":
     cov_status = start_coverage()
     if sys.argv[1] == "test_tasks":
         task_run_code(data_size=100, batch_size=2)
-    elif sys.argv[1] == "test_func":
-        func_run_code(data_size=100, batch_size=2)
     elif sys.argv[1] == "save_load":
         save_load_code(data_size=100, batch_size=2)
     elif sys.argv[1] == "only_pass_model":

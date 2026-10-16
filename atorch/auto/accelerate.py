@@ -8,7 +8,6 @@ from copy import deepcopy
 
 import torch
 
-from atorch.auto.analyser.analyser import get_analyser
 from atorch.auto.auto_accelerate_context import AutoAccelerateContext
 from atorch.auto.device_context import get_device_context
 from atorch.auto.dry_runner.dry_runner import get_dryrunner
@@ -18,7 +17,6 @@ from atorch.auto.opt_lib.optimization_library import SEMIAUTO_STRATEGIES, Optimi
 from atorch.auto.strategy import Strategy
 from atorch.common.constants import AutoAccelerateExtraArgs
 from atorch.common.log_utils import default_logger as logger
-from atorch.common.util_func import find_free_port
 from atorch.data import data_to_device
 from atorch.distributed.distributed import (
     create_parallel_group,
@@ -435,8 +433,6 @@ def auto_accelerate(
     optim_param_func=None,
     dataloader_args=None,
     distributed_sampler_cls=None,
-    excluded=None,
-    included=None,
     load_strategy=None,
     lr_scheduler_cls=None,
     lr_scheduler_args=None,
@@ -445,7 +441,7 @@ def auto_accelerate(
     **kargs,
 ):
     """
-    Auto-accelerate the model training. Find a best acceleration strategy and apply it to the model.
+    Auto-accelerate the model training by applying the given acceleration strategy to the model.
     Arguments:
     - model: nn_module defined as a non-distributed model
     - optim_func: optim_func can be a pytorch built-in optimizer function or a user-defined function, with params and
@@ -483,14 +479,13 @@ def auto_accelerate(
                           If None, data is passed to model by `model(data)`.
                           If unpack_sequence, `model(*data)`.
                           If unpack_dict, `model(**data)`.
-    - excluded: if not None, a list of optimization method names, which should NOT be used.
-    - included: if not None, a list of optimization method names, which must be used.
-    - load_strategy: if not None, load the acceleration stragegy and use it directly.
+    - load_strategy: the acceleration strategy to load and apply directly. Must not be None
+                     (the automatic strategy search feature has been removed).
                      filename to read if str, or
                      a memory to load from if bytes, or
                      a Strategy instance, or
                      list of optimization method name or (name, config).
-    - finetune_strategy: if True and load_strategy is not None, finetune the loaded strategy.
+    - finetune_strategy: if True, finetune the loaded strategy.
     - save_strategy_to_file: if not None, a file name for saving the acceleration strategy.
     - kargs: a dict. Including:
         sample_batch, batch_size, expand_sample_batch and sampler_seed(default to 0)
@@ -527,14 +522,13 @@ def auto_accelerate(
     )
     device_context = get_device_context()
 
-    verbose = False
-    time_limit = None
-    if "verbose" in kargs:
-        verbose = kargs["verbose"]
-    if "time_limit" in kargs:
-        time_limit = kargs["time_limit"]
+    if load_strategy is None:
+        logger.error(
+            "`load_strategy` must not be None; the automatic strategy search feature has been removed."
+        )
+        return False, None, None
 
-    ignore_dryrun_on_load_strategy = kargs.get("ignore_dryrun_on_load_strategy", True) and load_strategy is not None
+    ignore_dryrun_on_load_strategy = kargs.get("ignore_dryrun_on_load_strategy", True)
     skip_dryrun = if_skip_dryrun(model_context, ignore_dryrun_on_load_strategy)
 
     if hasattr(AutoAccelerateContext, "skip_dryrun"):
@@ -543,121 +537,56 @@ def auto_accelerate(
         AutoAccelerateContext.add_ac_attr("skip_dryrun", {AutoAccelerateContext.counter: skip_dryrun})
 
     dry_runner = get_dryrunner()
-    analyser = get_analyser()
     opt_lib = OptimizationLibrary()
 
-    strategy = None
-    if load_strategy is not None:
-        status, strategy = get_strategy(load_strategy)
+    status, strategy = get_strategy(load_strategy)
+    if not status:
+        logger.error("Error in loading strategy.")
+        return False, None, None
+    if not opt_lib.validate_strategy(strategy):
+        logger.error("Loaded strategy is invalid!")
+        return False, None, None
+    else:
+        logger.info(f"Strategy loaded.\n{strategy}")
+    # adjust strategy according to device_context and finetune_strategy
+    status, strategy = adjust_strategy(strategy, device_context, finetune_strategy, opt_lib)
+    if not status:
+        return False, None, None
+    # setup_parallel_group if needed
+    _, parallel_mode = strategy.get_parallel_mode()
+    if parallel_mode is not None:
+        status = run_setup_parallel_group_task(parallel_mode)
         if not status:
-            logger.error("Error in loading strategy.")
             return False, None, None
-        if not opt_lib.validate_strategy(strategy):
-            logger.error("Loaded strategy is invalid!")
+    if strategy.is_tunable():
+        status, strategy = run_tune_task(model_context, strategy, opt_lib)
+        if not status:
+            logger.error("Failed to tune the loaded strategy.")
+            return False, None, None
+    if skip_dryrun is True:
+        logger.info("Dryrun skipped for `ignore_dryrun_on_load_strategy` is True.")
+    else:
+        # run dryrun task to verify the strategy
+        status, result = run_dryrun_task(model_context, strategy, opt_lib, dry_runner)
+        if not status:
+            logger.error("Dryrun failed with loaded strategy.")
             return False, None, None
         else:
-            logger.info(f"Strategy loaded.\n{strategy}")
-        # adjust strategy according to device_context and finetune_strategy
-        status, strategy = adjust_strategy(strategy, device_context, finetune_strategy, opt_lib)
-        if not status:
-            return False, None, None
-        if not strategy.is_tunable() or not is_distributed():
-            # setup_parallel_group if needed
-            _, parallel_mode = strategy.get_parallel_mode()
-            if parallel_mode is not None:
-                status = run_setup_parallel_group_task(parallel_mode)
-                if not status:
-                    return False, None, None
-            if strategy.is_tunable():
-                status, strategy = run_tune_task(model_context, strategy, opt_lib)
-                if not status:
-                    logger.error("Failed to tune the loaded strategy.")
-                    return False, None, None
-            if skip_dryrun is True:
-                logger.info("Dryrun skipped for `ignore_dryrun_on_load_strategy` is True.")
-            else:
-                # run dryrun task to verify the strategy
-                status, result = run_dryrun_task(model_context, strategy, opt_lib, dry_runner)
-                if not status:
-                    logger.error("Dryrun failed with loaded strategy.")
-                    return False, None, None
-                else:
-                    logger.info(f"Dryrun result on rank {rank()}: {result}")
+            logger.info(f"Dryrun result on rank {rank()}: {result}")
 
-            # finish task to generate result
-            if save_strategy_to_file:
-                save_strategy(strategy, save_strategy_to_file)
-            status, result = run_finish_task(model_context, strategy, opt_lib)
-            assert status
-            if strategy is not None:
-                AutoAccelerateContext.add_ac_attr(
-                    "strategy_opt_names", {AutoAccelerateContext.counter: strategy.opt_names()}
-                )
-            logger.info(f"Load strategy successfully and ready for use.\n{strategy}")
-            _MetaModeContext.del_current_shard_flat_loader()
-            setattr(result.model, "_auto_acc_ctx_counter", AutoAccelerateContext.counter)
-            return True, assemble_result(result), strategy
-    else:
-        if (dataset is None and extra_args.get("sample_batch") is None) or optim_func is None:
-            logger.error("`load_strategy` should not be None.")
-            return False, None, None
-    engine = None
-    engine_port = 0
-    if rank() == 0 or (device_context.node_num == 1 and device_context.nproc_per_node == 1):
-        engine_port = find_free_port()
-        if strategy is not None:
-            strategy = strategy.convert_strategy_to_easydl_format()
-        # create AccelerationEngine instance
-        from atorch.auto.engine.acceleration_engine import AccelerationEngine
-
-        engine = AccelerationEngine(
-            device_context.context,
-            included_opts=included,
-            excluded_opts=excluded,
-            time_limit=time_limit,
-            load_strategy=strategy,
-            verbose=verbose,
+    # finish task to generate result
+    if save_strategy_to_file:
+        save_strategy(strategy, save_strategy_to_file)
+    status, result = run_finish_task(model_context, strategy, opt_lib)
+    assert status
+    if strategy is not None:
+        AutoAccelerateContext.add_ac_attr(
+            "strategy_opt_names", {AutoAccelerateContext.counter: strategy.opt_names()}
         )
-        engine.start_service(str(engine_port))
-
-    if is_distributed():
-        bcast_port = torch.tensor(engine_port, dtype=torch.int32)
-        if torch.cuda.is_available():
-            device = f"cuda:{local_rank()}"
-            bcast_port = bcast_port.to(device=device)
-        torch.distributed.broadcast(bcast_port, src=0)
-        engine_port = bcast_port.item()
-    engine_addr = os.getenv("MASTER_ADDR", "localhost")
-    from atorch.auto.engine_client import EngineClient
-
-    engine_client = EngineClient(engine_addr, str(engine_port))
-
-    while True:
-        task = engine_client.get_task()
-        if task.type == "FINISH" and save_strategy_to_file:
-            save_strategy(task.strategy, save_strategy_to_file)
-        status, result = run_task(
-            model_context, task, opt_lib=opt_lib, dry_runner=dry_runner, analyser=analyser, verbose=verbose
-        )
-        if task.type == "FINISH" or task.type == "FAIL":
-            if engine is not None:
-                engine.tear_down()
-                del engine
-            if task.type == "FINISH":
-                assert status is True
-                if task.strategy is not None:
-                    AutoAccelerateContext.add_ac_attr(
-                        "strategy_opt_names", {AutoAccelerateContext.counter: task.strategy.opt_names()}
-                    )
-                setattr(result.model, "_auto_acc_ctx_counter", AutoAccelerateContext.counter)
-                logger.info(f"auto_accelerate finished!\n{task.strategy}")
-                _MetaModeContext.del_current_shard_flat_loader()
-                return True, assemble_result(result), task.strategy
-            else:
-                logger.error("auto_accelerate cannot find a valid strategy to train model!")
-                return False, None, None
-        elif task.type != "WAIT":
-            engine_client.report_task_result(task, status, result)
+    logger.info(f"Load strategy successfully and ready for use.\n{strategy}")
+    _MetaModeContext.del_current_shard_flat_loader()
+    setattr(result.model, "_auto_acc_ctx_counter", AutoAccelerateContext.counter)
+    return True, assemble_result(result), strategy
 
 
 def strategy_reset(strategy, opt_lib):

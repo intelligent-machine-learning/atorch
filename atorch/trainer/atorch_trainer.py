@@ -501,8 +501,6 @@ class AtorchTrainer:
             model_input_format=self.model_input_format,
             optim_args=self.optim_args,
             optim_param_func=self.optim_param_func if self.optim_param_func is not None else None,
-            excluded=self.args.excluded,
-            included=self.args.included,
             load_strategy=self.load_strategy,
             finetune_strategy=self.args.finetune_strategy,
             save_strategy_to_file=self.args.save_strategy_to_file,

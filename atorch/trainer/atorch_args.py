@@ -118,14 +118,8 @@ class AtorchArguments(Seq2SeqTrainingArguments):
             "help": "if not None, custom distributed sampler with same interface as pytorch's DistributedSampler."
         },
     )
-    excluded: Optional[List[str]] = field(
-        default=None, metadata={"help": "A list of optimization method names, which should NOT be used."}
-    )
-    included: Optional[List[str]] = field(
-        default=None, metadata={"help": "A list of optimization method names, which should NOT be used."}
-    )
     finetune_strategy: bool = field(
-        default=False, metadata={"help": "If True and `load_strategy` is not None, finetune the loaded strategy."}
+        default=False, metadata={"help": "If True, finetune the loaded strategy."}
     )
     save_strategy_to_file: Optional[str] = field(
         default=None, metadata={"help": "If not None, a file name for saving the acceleration strategy."}

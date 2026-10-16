@@ -15,9 +15,5 @@ Some ATorch features require more Python packages than those listed in ATorch's 
 ## ATorch megatron trainer
 - megatron
 
-## auto_accelerate fully automatic mode
-- pymoo==0.5.0
-- GPy
-
 ## apex fused kernels
 - apex
